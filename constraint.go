@@ -45,21 +45,22 @@ var (
 	ErrLengthExact   = errors.New("length must be exactly")
 	ErrLengthBetween = errors.New("length must be between")
 
-	ErrCharSetOnly   = errors.New("can only contain characters from")
-	ErrCharSetAny    = errors.New("must contain at least one character from")
-	ErrCharSetAll    = errors.New("not contains chars from")
-	ErrCharSetNo     = errors.New("must not contain any characters from")
-	ErrNotMatch      = errors.New("not match pattern")
-	ErrNotValidEmail = errors.New("not valid email address")
-	ErrNotValidURL   = errors.New("not valid url")
-	ErrNotOneOf      = errors.New("value must be one of")
-	ErrMustGt        = errors.New("must be greater than")
-	ErrMustGte       = errors.New("must be greater than or equal to")
-	ErrMustLt        = errors.New("must be less than")
-	ErrMustLte       = errors.New("must be less than or equal to")
-	ErrMustBetween   = errors.New("must be between")
-	ErrMustBeTrue    = errors.New("must be true")
-	ErrMustBeFalse   = errors.New("must be false")
+	ErrCharSetOnly      = errors.New("can only contain characters from")
+	ErrCharSetAny       = errors.New("must contain at least one character from")
+	ErrCharSetAll       = errors.New("not contains chars from")
+	ErrCharSetNo        = errors.New("must not contain any characters from")
+	ErrNotMatch         = errors.New("not match pattern")
+	ErrNotValidEmail    = errors.New("not valid email address")
+	ErrNotValidURL      = errors.New("not valid url")
+	ErrNotOneOf         = errors.New("value must be one of")
+	ErrMustGt           = errors.New("must be greater than")
+	ErrMustGte          = errors.New("must be greater than or equal to")
+	ErrMustLt           = errors.New("must be less than")
+	ErrMustLte          = errors.New("must be less than or equal to")
+	ErrMustBetween      = errors.New("must be between")
+	ErrMustBeTrue       = errors.New("must be true")
+	ErrMustBeFalse      = errors.New("must be false")
+	ErrDecimalPrecision = errors.New("invalid decimal precision/scale")
 )
 
 // value is a private helper to get the character set and its descriptive name.
@@ -371,6 +372,68 @@ func isLessThan[T Number | time.Time](a, b T) bool {
 
 // DefaultTimeLayouts are the default layouts used to parse time strings.
 var DefaultTimeLayouts = []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05", "2006-01-02"}
+
+// Decimal validates that a string representation of a decimal number conforms to
+// the specified precision (total digits) and scale (fractional digits).
+// Behavior:
+//   - Empty string is considered valid (presence is handled elsewhere).
+//   - Accepts optional leading '+' or '-' sign.
+//   - Does not accept scientific notation (e.g., 1e3).
+//   - Counts digits from integer and fractional parts; total digits must be <= precision
+//     and fractional digits must be <= scale.
+func Decimal(precision, scale int) ValidateFunc[string] {
+	return func() (string, Validator[string]) {
+		name := fmt.Sprintf("decimal(%d,%d)", precision, scale)
+		return name, func(s string) error {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				return nil
+			}
+			// optional sign
+			if s[0] == '+' || s[0] == '-' {
+				s = s[1:]
+			}
+			// disallow scientific notation
+			if strings.ContainsAny(s, "eE") {
+				return fmt.Errorf("%w: unsupported format", ErrDecimalPrecision)
+			}
+			parts := strings.SplitN(s, ".", 3)
+			if len(parts) > 2 {
+				return fmt.Errorf("%w: invalid format", ErrDecimalPrecision)
+			}
+			intPart := parts[0]
+			fracPart := ""
+			if len(parts) == 2 {
+				fracPart = parts[1]
+			}
+			// allow leading dot like `.12` -> intPart == ""
+			if intPart == "" {
+				intPart = "0"
+			}
+			if !allDigits(intPart) || !allDigits(fracPart) {
+				return fmt.Errorf("%w: contains non-digit characters", ErrDecimalPrecision)
+			}
+			totalDigits := len(intPart) + len(fracPart)
+			if totalDigits > precision || len(fracPart) > scale {
+				return fmt.Errorf("%w %d,%d", ErrDecimalPrecision, precision, scale)
+			}
+			return nil
+		}
+	}
+}
+
+// allDigits returns true iff s consists only of ASCII digits (0-9).
+func allDigits(s string) bool {
+	if s == "" {
+		return true
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
 
 // ParseStringTo converts a string into the specified FieldType T.
 // This is shared by view/value layers when converting URL params into typed values.

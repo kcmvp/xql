@@ -74,7 +74,7 @@ type OrderItem struct {
 	OrderID   int64
 	ProductID int64
 	Quantity  int64
-	UnitPrice float64
+	UnitPrice float64 `xql:"name:unit_price; type:decimal(10,2)"`
 }
 
 func (oi OrderItem) Table() string { return "order_items" }
