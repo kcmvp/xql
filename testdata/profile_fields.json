@@ -1,0 +1,11 @@
+{
+  "ID": "xql.NewField[Profile, int64](\"id\", \"ID\")",
+  "AccountID": "xql.NewField[Profile, int64](\"account_id\", \"AccountID\")",
+  "Bio": "xql.NewField[Profile, string](\"bio\", \"Bio\")",
+  "Birthday": "xql.NewField[Profile, time.Time](\"birthday\", \"Birthday\")",
+  "CreatedAt": "xql.NewField[Profile, time.Time](\"created_at\", \"CreatedAt\")",
+  "UpdatedAt": "xql.NewField[Profile, time.Time](\"updated_at\", \"UpdatedAt\")",
+  "CreatedBy": "xql.NewField[Profile, string](\"created_by\", \"CreatedBy\")",
+  "UpdatedBy": "xql.NewField[Profile, string](\"updated_by\", \"UpdatedBy\")"
+}
+
