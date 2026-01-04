@@ -6,7 +6,6 @@ package {{ .PackageName }}
 import (
     . "{{ .EntityImportPath }}"
     "{{ .ModulePath }}"
-    "{{ .ModulePath }}/view"
 {{- range .Imports }}
     "{{ . }}"
 {{- end }}
@@ -16,7 +15,6 @@ import (
 var (
 {{- range .Fields }}
     {{ .GoName }} = {{ $.ModulePkgName }}.NewField[{{ $.StructName }}, {{ .GoType }}]("{{ .Name }}", "{{ .GoName }}"{{ .ValidatorArgs }})
-    View{{ .GoName }} = view.WrapField[{{ .GoType }}]({{ .GoName }})
 {{- end }}
 )
 

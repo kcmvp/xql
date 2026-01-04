@@ -17,6 +17,11 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// zero returns the zero value of a generic type T — used in tests to produce a
+// value whose dynamic type can be inspected without writing type-specific
+// literals like bool(false).
+func zero[T any]() T { var z T; return z }
+
 func TestTypedString(t *testing.T) {
 	now := time.Now()
 	tests := []struct {
@@ -38,31 +43,31 @@ func TestTypedString(t *testing.T) {
 		{
 			name:       "bool_true_ok",
 			input:      "true",
-			targetType: bool(false),
+			targetType: zero[bool](),
 			want:       true,
 		},
 		{
 			name:       "bool_false_ok",
 			input:      "false",
-			targetType: bool(false),
+			targetType: zero[bool](),
 			want:       false,
 		},
 		{
 			name:       "bool_1_ok",
 			input:      "1",
-			targetType: bool(false),
+			targetType: zero[bool](),
 			want:       true,
 		},
 		{
 			name:       "bool_0_ok",
 			input:      "0",
-			targetType: bool(false),
+			targetType: zero[bool](),
 			want:       false,
 		},
 		{
 			name:                "bool_invalid_string",
 			input:               "not-a-bool",
-			targetType:          bool(false),
+			targetType:          zero[bool](),
 			expectedErrContains: "could not parse 'not-a-bool' as bool",
 		},
 		// Integer cases
@@ -659,18 +664,18 @@ func TestTyped(t *testing.T) {
 				name:       "bool_ok",
 				json:       `{"value": true}`,
 				want:       mo.Ok(any(true)),
-				targetType: bool(false),
+				targetType: zero[bool](),
 			},
 			{
 				name:        "bool_from_string_fail",
 				json:        `{"value": "true"}`,
-				targetType:  bool(false),
+				targetType:  zero[bool](),
 				expectedErr: validator.ErrTypeMismatch,
 			},
 			{
 				name:        "bool_from_number_fail",
 				json:        `{"value": 1}`,
-				targetType:  bool(false),
+				targetType:  zero[bool](),
 				expectedErr: validator.ErrTypeMismatch,
 			},
 		}
@@ -1861,12 +1866,4 @@ func TestWrapField_Validators(t *testing.T) {
 	require.True(t, r.IsError())
 	r = vf.validateRaw("abcd")
 	require.False(t, r.IsError())
-}
-
-func TestWrapField_TypeMismatchPanics(t *testing.T) {
-	f := xql.NewField[dummyEntity, string]("age", "Age")
-	// Attempt to wrap as int should panic
-	require.Panics(t, func() {
-		WrapField[int](f)
-	})
 }

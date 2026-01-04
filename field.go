@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/kcmvp/xql/entity"
-	"github.com/kcmvp/xql/internal"
 	"github.com/samber/lo"
 )
 
@@ -32,12 +31,19 @@ import (
 //    generator for convenience. In strict layering designs validators can
 //    be owned by the `view` package at runtime.
 
+// sealer is a private token type used to seal implementations of the Field interface.
+// Requiring this unexported type in the unexported seal method prevents other
+// packages from implementing Field because they cannot name the parameter type.
+// Keeping the type in this package gives the strongest enforcement.
+type sealer struct{}
+
 // Field describes a single field's persistence metadata.
 //
 // Implementations provide read-only accessors:
 //   - QualifiedName(): the DB-qualified column name in the form "table.column[.view]".
 //     For persistent fields we encode the view as a third segment: "table.column.view".
 //   - Scope(): the field's scope (table).
+//   - ViewName(): the view/json key associated with the field (the last segment).
 //
 // Implementations may be provided by this module or by adapters in other
 // packages (view wrappers, generator output, etc.).
@@ -48,9 +54,11 @@ type Field interface {
 	// persistent fields we return the composite "table.column.view" which
 	// encodes the view name as the last segment.
 	QualifiedName() string
-	// seal prevents external modules from implementing Field by requiring the
-	// internal.Sealer parameter type which is only importable from within the module.
-	seal(internal.Sealer)
+	// View returns the view/json key (the last segment) for this field.
+	View() string
+	// seal prevents external packages from implementing Field by requiring the
+	// unexported `sealer` parameter type which cannot be named outside this package.
+	seal(sealer)
 }
 
 // Number is a type constraint for numeric native Go types.
@@ -88,8 +96,13 @@ func (f *PersistentField[E]) QualifiedName() string {
 	return fmt.Sprintf("%s.%s.%s", f.table, f.column, f.view)
 }
 
+// ViewName returns the view (JSON key) part of the persistent field.
+func (f *PersistentField[E]) View() string {
+	return f.view
+}
+
 // implement seal so PersistentField satisfies Field
-func (f *PersistentField[E]) seal(internal.Sealer) {}
+func (f *PersistentField[E]) seal(sealer) {}
 
 var _ Field = (*PersistentField[int64])(nil)
 
