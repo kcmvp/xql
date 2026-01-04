@@ -6,6 +6,7 @@ package {{ .PackageName }}
 import (
     . "{{ .EntityImportPath }}"
     "{{ .ModulePath }}"
+    "{{ .ModulePath }}/view"
 {{- range .Imports }}
     "{{ . }}"
 {{- end }}
@@ -14,7 +15,8 @@ import (
 // {{ .StructName }}Fields provides access to the entity's field definitions.
 var (
 {{- range .Fields }}
-    {{ .GoName }} = {{ $.ModulePkgName }}.NewField[{{ $.StructName }}, {{ .GoType }}]("{{ .Name }}", "{{ .GoName }}")
+    {{ .GoName }} = {{ $.ModulePkgName }}.NewField[{{ $.StructName }}, {{ .GoType }}]("{{ .Name }}", "{{ .GoName }}"{{ .ValidatorArgs }})
+    View{{ .GoName }} = view.WrapField[{{ .GoType }}]({{ .GoName }})
 {{- end }}
 )
 

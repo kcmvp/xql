@@ -49,11 +49,25 @@ func compareGoFileWithJSON(t *testing.T, goFilePath, jsonFilePath string) {
 
 	// Unmarshal the JSON file
 	var expectedFields map[string]string
-	err = json.Unmarshal(jsonContent, &expectedFields)
-	require.NoError(t, err)
+	if len(jsonContent) == 0 {
+		expectedFields = map[string]string{}
+	} else {
+		err = json.Unmarshal(jsonContent, &expectedFields)
+		require.NoError(t, err)
+	}
 
-	// Compare the fields
-	require.Equal(t, expectedFields, fields)
+	// Filter out view wrapper variables (View*) from actual fields since
+	// generator may emit both persistent field variables and view wrappers.
+	filtered := make(map[string]string, len(fields))
+	for k, v := range fields {
+		if strings.HasPrefix(k, "View") {
+			continue
+		}
+		filtered[k] = v
+	}
+
+	// Compare the fields (persistent-only)
+	require.Equal(t, expectedFields, filtered)
 }
 
 func compareFiles(t *testing.T, generatedFilePath, testDataFilePath string) {
@@ -108,6 +122,23 @@ func TestGeneration(t *testing.T) {
 		filepath.Join(internal.Current.GenPath(), "field", "order", "order_gen.go"),
 		filepath.Join(testDataDir, "order_fields.json"),
 	)
+
+	// Also verify all generated field packages have matching testdata JSON
+	genFieldDir := filepath.Join(internal.Current.GenPath(), "field")
+	if entries, err := os.ReadDir(genFieldDir); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			pkg := e.Name()
+			goFile := filepath.Join(genFieldDir, pkg, pkg+"_gen.go")
+			jsonFile := filepath.Join(testDataDir, pkg+"_fields.json")
+			// ensure files exist and match; compareGoFileWithJSON will assert
+			compareGoFileWithJSON(t, goFile, jsonFile)
+		}
+	} else {
+		t.Fatalf("failed to read generated field dir: %v", err)
+	}
 
 	// Verify the output for schemas
 	for _, db := range []string{"sqlite", "postgres", "mysql"} {

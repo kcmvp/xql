@@ -1,0 +1,9 @@
+{
+  "ID": "xql.NewField[AccountRole, int64](\"id\", \"ID\")",
+  "AccountID": "xql.NewField[AccountRole, int64](\"account_id\", \"AccountID\")",
+  "RoleID": "xql.NewField[AccountRole, int64](\"role_id\", \"RoleID\")",
+  "CreatedAt": "xql.NewField[AccountRole, time.Time](\"created_at\", \"CreatedAt\")",
+  "UpdatedAt": "xql.NewField[AccountRole, time.Time](\"updated_at\", \"UpdatedAt\")",
+  "CreatedBy": "xql.NewField[AccountRole, string](\"created_by\", \"CreatedBy\")",
+  "UpdatedBy": "xql.NewField[AccountRole, string](\"updated_by\", \"UpdatedBy\")"
+}

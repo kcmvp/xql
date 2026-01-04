@@ -2,9 +2,11 @@ package xql
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/kcmvp/xql/entity"
+	"github.com/kcmvp/xql/internal"
 	"github.com/samber/lo"
 )
 
@@ -14,9 +16,8 @@ import (
 // Key goals:
 //  - Keep the metadata model small and deterministic so generated Schemas
 //    are easy to inspect and consume at runtime.
-//  - Expose only a read-only API for field descriptors. Concrete
-//    implementations are sealed to this module to avoid accidental
-//    third-party implementations that break expectations.
+//  - Expose a small read-only API for field descriptors used by generators
+//    and runtime adapters.
 //  - Provide a tiny factory helper `NewField` that derives the DB table
 //    name from a concrete entity type (via `entity.Entity`) and validates
 //    basic invariants early.
@@ -31,27 +32,25 @@ import (
 //    generator for convenience. In strict layering designs validators can
 //    be owned by the `view` package at runtime.
 
-// Field is a sealed interface describing a single field's metadata.
+// Field describes a single field's persistence metadata.
 //
-// Implementations provide three read-only accessors:
-//   - Name(): the canonical provider name (usually the exported Go field name)
-//   - QualifiedName(): the DB-qualified column name in the form "table.column"
-//   - ViewName(): the JSON/view facing name (the key used in validated objects)
+// Implementations provide read-only accessors:
+//   - QualifiedName(): the DB-qualified column name in the form "table.column[.view]".
+//     For persistent fields we encode the view as a third segment: "table.column.view".
+//   - Scope(): the field's scope (table).
 //
-// The unexported seal() method prevents external packages from
-// implementing Field; only code inside this module (and generator-produced
-// code that lives in the same module) may implement Field.
+// Implementations may be provided by this module or by adapters in other
+// packages (view wrappers, generator output, etc.).
 type Field interface {
-	// Scope returns the field's scope. it returns the table name for a persistent field; returns null for a non-persistent field.
+	// Scope returns the field's scope; it returns the table name for a persistent field.
 	Scope() string
-	// Name returns the provider identifier used by generated code and by
-	// view validation. It should be unique inside a Schema.
-	Name() string
-	// QualifiedName returns a DB-qualified column reference in the form
-	// "table.column". Consumers (SQL builders) rely on this format.
+	// QualifiedName returns a DB-qualified column reference. For generated
+	// persistent fields we return the composite "table.column.view" which
+	// encodes the view name as the last segment.
 	QualifiedName() string
-	// seal prevents external implementations of Field.
-	seal()
+	// seal prevents external modules from implementing Field by requiring the
+	// internal.Sealer parameter type which is only importable from within the module.
+	seal(internal.Sealer)
 }
 
 // Number is a type constraint for numeric native Go types.
@@ -67,63 +66,67 @@ type FieldType interface {
 	Number | string | time.Time | bool
 }
 
-// PersistentField is a semantic alias: a Field that carries a Go type
-// parameter to enable type-safe validator factories or codegen hints.
-type PersistentField interface {
-	Field
-}
-
-// persistentField is the internal, immutable implementation of
-// PersistentField. The fields are all unexported; instances are produced
-// using `NewField`.
-type persistentField[E FieldType] struct {
+// PersistentField is the internal, immutable implementation of Field.
+// Instances are produced using `NewField`.
+type PersistentField[E FieldType] struct {
 	table  string
 	column string
 	view   string
 	vfs    []ValidateFunc[E]
 }
 
-func (f persistentField[E]) Scope() string {
+func (f *PersistentField[E]) Scope() string {
 	return f.table
 }
 
-// Name returns column name associated with this field.
-func (f persistentField[E]) Name() string { return f.column }
-
-// seal implements the package-only sealing marker.
-func (f persistentField[E]) seal() {}
-
-// QualifiedName returns the DB-qualified column name in the canonical
-// "table.column" format used by SQL builders and token rewriting.
-func (f persistentField[E]) QualifiedName() string {
-	return fmt.Sprintf("%s.%s", f.table, f.column)
+// QualifiedName returns the DB-qualified identifier. For persistent fields
+// we include the view as the last segment: "table.column.view". The table
+// component may itself contain '.' (schema-qualified table names are
+// supported). We ensure the returned string is stable and deterministic.
+func (f *PersistentField[E]) QualifiedName() string {
+	// Compose as table.column.view
+	return fmt.Sprintf("%s.%s.%s", f.table, f.column, f.view)
 }
 
-var _ PersistentField = (*persistentField[int64])(nil)
+// implement seal so PersistentField satisfies Field
+func (f *PersistentField[E]) seal(internal.Sealer) {}
 
-// NewField creates a PersistentField for entity type E with Go type hint T.
+var _ Field = (*PersistentField[int64])(nil)
+
+// Constraints returns a copy of the validator factory functions attached to the
+// persistent field. Callers may convert these factories into concrete
+// validators suitable for their layer.
+func (f *PersistentField[E]) Constraints() []ValidateFunc[E] {
+	if f == nil || len(f.vfs) == 0 {
+		return nil
+	}
+	cp := make([]ValidateFunc[E], len(f.vfs))
+	copy(cp, f.vfs)
+	return cp
+}
+
+// NewField creates a Field for entity type E with Go type hint T.
 //
 // Parameters:
-//   - column: DB column name. Must be non-empty.
-//   - view: JSON/view key name (also used as the provider name when the
-//     generator does not supply an explicit provider name). Must be non-empty.
+//   - column: DB column name. Must be non-empty and contain no '.'.
+//   - view: JSON/view key name (used as the provider/view name). Must be non-empty and contain no '.'.
 //   - vfs: optional validator factory functions for the field.
 //
 // Behavior:
 //   - The table name is derived by instantiating a zero value of E and
 //     calling its Table() method. The function asserts the table and the
 //     provided strings are non-empty using `lo.Assert`.
-//
-// Example:
-//
-//	var ID = NewField[Account, int64]("id", "ID")
-func NewField[E entity.Entity, T FieldType](column string, view string, vfs ...ValidateFunc[T]) PersistentField {
+func NewField[E entity.Entity, T FieldType](column string, view string, vfs ...ValidateFunc[T]) *PersistentField[T] {
 	var e E
 	table := e.Table()
-	lo.Assert(table != "", "table must not return empty string")
+	lo.Assert(strings.TrimSpace(table) != "", "table must not return empty string")
 	lo.Assert(column != "", "column must not return empty string")
 	lo.Assert(view != "", "view must not return empty string")
-	return &persistentField[T]{
+	// column and view must not contain '.' to keep provider parsing simple
+	if strings.Contains(column, ".") || strings.Contains(view, ".") {
+		panic("column and view must not contain '.'")
+	}
+	return &PersistentField[T]{
 		table:  table,
 		column: column,
 		view:   view,

@@ -2,6 +2,8 @@ package xql
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // Full set of tests migrated from meta/constraint_test.go
@@ -170,4 +172,37 @@ func TestSmokeValidatorsCompile(t *testing.T) {
 	_ = f1(0.5)
 	_, b1 := BeFalse()()
 	_ = b1(false)
+}
+
+// Decimal validator tests (moved from constraint_decimal_test.go)
+func TestDecimalValidator_Valid(t *testing.T) {
+	vfn := DecimalString(12, 2)
+	name, fn := vfn()
+	require.Equal(t, "decimal(12,2)", name)
+	req := []string{
+		"0",
+		"0.0",
+		"0.00",
+		"1234567890.12", // 12 digits total
+		"-1234567890.12",
+		".12",
+	}
+	for _, s := range req {
+		require.NoError(t, fn(s), "should accept %s", s)
+	}
+}
+
+func TestDecimalValidator_Invalid(t *testing.T) {
+	vfn := DecimalString(5, 2)
+	_, fn := vfn()
+	cases := []string{
+		"1234.567",  // frac > 2
+		"123456.78", // total digits 8 > 5
+		"1e3",
+		"12a.34",
+		"..12",
+	}
+	for _, s := range cases {
+		require.Error(t, fn(s), "should reject %s", s)
+	}
 }

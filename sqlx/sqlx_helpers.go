@@ -69,12 +69,23 @@ func or(wheres ...Where) Where {
 }
 
 func dbQualifiedNameFromQName(q string) string {
-	parts := strings.Split(q, ".")
-	if len(parts) != 2 {
+	// We expect q to be either:
+	//  - "table.column" (no view)
+	//  - "table.column.view" (view included)
+	// Table may itself contain '.' (schema-qualified). To handle both cases
+	// we parse from the right: find last '.' (separator before view), then
+	// the previous '.' separates table and column.
+	last := strings.LastIndex(q, ".")
+	if last == -1 {
 		return q
 	}
-	table := parts[0]
-	col := parts[1]
+	prev := strings.LastIndex(q[:last], ".")
+	if prev == -1 {
+		// only one dot present -> treat as table.column
+		return q
+	}
+	table := q[:prev]
+	col := q[prev+1 : last]
 	return fmt.Sprintf("%s.%s", table, col)
 }
 
@@ -172,8 +183,8 @@ func updateSQL[T entity.Entity](schema Schema, g ValueObject, where Where) (stri
 		}
 	} else {
 		for _, f := range schema {
-			col := f.Name()
-			vOpt := g.Get(col)
+			viewKey := f.QualifiedName()
+			vOpt := g.Get(viewKey)
 			if vOpt.IsAbsent() {
 				continue
 			}
@@ -249,7 +260,7 @@ func updateSQLFromValues[T entity.Entity](g ValueObject, where Where) (string, [
 		for _, f := range schema {
 			colName := dbQualifiedNameFromQName(f.QualifiedName())
 			sets = append(sets, fmt.Sprintf("%s = ?", colName))
-			if vOpt := g.Get(f.Name()); !vOpt.IsAbsent() {
+			if vOpt := g.Get(f.QualifiedName()); !vOpt.IsAbsent() {
 				args = append(args, vOpt.MustGet())
 			}
 		}
@@ -441,7 +452,7 @@ func rowsToValueObjects(rows *sql.Rows, schema Schema) ([]ValueObject, error) {
 
 		m := make(map[string]any, n)
 		for i, f := range schema {
-			m[f.Name()] = vals[i]
+			m[f.QualifiedName()] = vals[i]
 		}
 		out = append(out, valueObject{Data: m})
 	}

@@ -7,3 +7,4 @@
   "CreatedBy": "xql.NewField[Order, string](\"created_by\", \"CreatedBy\")",
   "UpdatedBy": "xql.NewField[Order, string](\"updated_by\", \"UpdatedBy\")"
 }
+

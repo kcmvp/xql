@@ -1,0 +1,10 @@
+{
+  "ID": "xql.NewField[Product, int64](\"id\", \"ID\")",
+  "SKU": "xql.NewField[Product, string](\"sku\", \"SKU\")",
+  "Name": "xql.NewField[Product, string](\"name\", \"Name\")",
+  "Price": "xql.NewField[Product, float64](\"price\", \"Price\")",
+  "CreatedAt": "xql.NewField[Product, time.Time](\"created_at\", \"CreatedAt\")",
+  "UpdatedAt": "xql.NewField[Product, time.Time](\"updated_at\", \"UpdatedAt\")",
+  "CreatedBy": "xql.NewField[Product, string](\"created_by\", \"CreatedBy\")",
+  "UpdatedBy": "xql.NewField[Product, string](\"updated_by\", \"UpdatedBy\")"
+}

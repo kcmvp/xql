@@ -17,7 +17,9 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -59,19 +61,20 @@ type TemplateData struct {
 
 // Field represents a single column in a database table, derived from a Go struct field.
 type Field struct {
-	Name       string // The database column name (e.g., "creation_time").
-	GoName     string // The original Go field name (e.g., "CreatedAt").
-	GoType     string // The Go type of the field (e.g., "time.Time").
-	DBType     string // The specific SQL type for the column (e.g., "TIMESTAMP WITH TIME ZONE").
-	IsPK       bool   // True if this field is the primary key.
-	IsNotNull  bool   // True if the column has a NOT NULL constraint.
-	IsUnique   bool   // True if the column has a UNIQUE constraint.
-	IsIndexed  bool   // True if an index should be created on this column.
-	Default    string // The default value for the column, as a string.
-	FKTable    string // The table referenced by a foreign key.
-	FKColumn   string // The column referenced by a foreign key.
-	Warning    string // A warning message associated with this field, e.g., for discouraged PK types.
-	IsEmbedded bool
+	Name          string // The database column name (e.g., "creation_time").
+	GoName        string // The original Go field name (e.g., "CreatedAt").
+	GoType        string // The Go type of the field (e.g., "time.Time").
+	DBType        string // The specific SQL type for the column (e.g., "TIMESTAMP WITH TIME ZONE").
+	IsPK          bool   // True if this field is the primary key.
+	IsNotNull     bool   // True if the column has a NOT NULL constraint.
+	IsUnique      bool   // True if the column has a UNIQUE constraint.
+	IsIndexed     bool   // True if an index should be created on this column.
+	Default       string // The default value for the column, as a string.
+	FKTable       string // The table referenced by a foreign key.
+	FKColumn      string // The column referenced by a foreign key.
+	Warning       string // A warning message associated with this field, e.g., for discouraged PK types.
+	IsEmbedded    bool
+	ValidatorArgs string // pre-rendered validator arguments (prefixed with ", ") to inject into templates
 }
 
 // isSupportedType checks if a field type is valid.
@@ -396,6 +399,10 @@ func generateFieldsFromMeta(metas []EntityMeta) error {
 		return fmt.Errorf("failed to parse fields template: %w", err)
 	}
 
+	// precompile regexes
+	varcharRe := regexp.MustCompile(`(?i)^varchar\((\d+)\)`)                                  // capture length
+	decimalRe := regexp.MustCompile(`(?i)^(?:decimal|numeric)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)`) // capture precision,scale
+
 	for _, meta := range metas {
 		imports := lo.Uniq(lo.FilterMap(meta.Fields, func(f Field, _ int) (string, bool) {
 			if strings.Contains(f.GoType, ".") {
@@ -419,11 +426,72 @@ func generateFieldsFromMeta(metas []EntityMeta) error {
 			}
 		}
 
+		// make a copy of fields so we can annotate ValidatorArgs per-field
+		fieldsCopy := make([]Field, len(meta.Fields))
+		copy(fieldsCopy, meta.Fields)
+
+		// build validator args based on DBType
+		for i := range fieldsCopy {
+			f := &fieldsCopy[i]
+			db := strings.TrimSpace(strings.ToLower(f.DBType))
+			var args []string
+			if db != "" {
+				if f.GoType == "string" {
+					if m := varcharRe.FindStringSubmatch(db); len(m) == 2 {
+						// varchar(N) -> MaxLength(N)
+						n := m[1]
+						args = append(args, fmt.Sprintf("%s.MaxLength(%s)", modulePkgName, n))
+					} else if m := decimalRe.FindStringSubmatch(db); len(m) == 3 {
+						// decimal(P,S) -> Decimal(P,S) for string backing
+						p := m[1]
+						s := m[2]
+						args = append(args, fmt.Sprintf("%s.Decimal(%s, %s)", modulePkgName, p, s))
+					}
+				} else {
+					// for non-string types
+					if m := decimalRe.FindStringSubmatch(db); len(m) == 3 {
+						p, _ := strconv.Atoi(m[1])
+						s, _ := strconv.Atoi(m[2])
+						// if float type use generic Decimal[T]
+						switch f.GoType {
+						case "float32", "float64":
+							args = append(args, fmt.Sprintf("%s.Decimal[%s](%s, %s)", modulePkgName, f.GoType, m[1], m[2]))
+						default:
+							// integers / unsigned: compute integer max and emit Gte/Lte
+							intDigits := p - s
+							if intDigits < 1 {
+								intDigits = 1
+							}
+							maxInt := int64(1)
+							for k := 0; k < intDigits; k++ {
+								maxInt *= 10
+							}
+							maxInt = maxInt - 1
+							switch f.GoType {
+							case "int", "int8", "int16", "int32", "int64":
+								args = append(args, fmt.Sprintf("%s.Gte[%s](%d)", modulePkgName, f.GoType, -maxInt))
+								args = append(args, fmt.Sprintf("%s.Lte[%s](%d)", modulePkgName, f.GoType, maxInt))
+							case "uint", "uint8", "uint16", "uint32", "uint64":
+								args = append(args, fmt.Sprintf("%s.Gte[%s](%d)", modulePkgName, f.GoType, 0))
+								args = append(args, fmt.Sprintf("%s.Lte[%s](%d)", modulePkgName, f.GoType, maxInt))
+							}
+						}
+					}
+				}
+			}
+			if len(args) > 0 {
+				// prefix with comma and space to append into template call
+				f.ValidatorArgs = ", " + strings.Join(args, ", ")
+			} else {
+				f.ValidatorArgs = ""
+			}
+		}
+
 		data := TemplateData{
 			PackageName:      strings.ToLower(meta.StructName),
 			StructName:       meta.StructName,
 			Imports:          imports,
-			Fields:           meta.Fields,
+			Fields:           fieldsCopy,
 			ModulePath:       internal.ToolModulePath(),
 			ModulePkgName:    modulePkgName,
 			EntityImportPath: meta.PkgPath,

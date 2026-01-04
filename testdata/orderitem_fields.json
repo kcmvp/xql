@@ -1,0 +1,11 @@
+{
+  "ID": "xql.NewField[OrderItem, int64](\"id\", \"ID\")",
+  "OrderID": "xql.NewField[OrderItem, int64](\"order_id\", \"OrderID\")",
+  "ProductID": "xql.NewField[OrderItem, int64](\"product_id\", \"ProductID\")",
+  "Quantity": "xql.NewField[OrderItem, int64](\"quantity\", \"Quantity\")",
+  "UnitPrice": "xql.NewField[OrderItem, float64](\"unit_price\", \"UnitPrice\", xql.Decimal[float64](10, 2))",
+  "CreatedAt": "xql.NewField[OrderItem, time.Time](\"created_at\", \"CreatedAt\")",
+  "UpdatedAt": "xql.NewField[OrderItem, time.Time](\"updated_at\", \"UpdatedAt\")",
+  "CreatedBy": "xql.NewField[OrderItem, string](\"created_by\", \"CreatedBy\")",
+  "UpdatedBy": "xql.NewField[OrderItem, string](\"updated_by\", \"UpdatedBy\")"
+}
