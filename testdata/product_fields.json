@@ -8,4 +8,3 @@
   "CreatedBy": "xql.NewField[Product, string](\"created_by\", \"CreatedBy\")",
   "UpdatedBy": "xql.NewField[Product, string](\"updated_by\", \"UpdatedBy\")"
 }
-

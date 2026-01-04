@@ -1,0 +1,12 @@
+{
+  "ID": "xql.NewField[Account, int64](\"id\", \"ID\")",
+  "Email": "xql.NewField[Account, string](\"email\", \"Email\")",
+  "Nickname": "xql.NewField[Account, string](\"nick_name\", \"Nickname\", xql.MaxLength(100))",
+  "Category": "xql.NewField[Account, int64](\"category\", \"Category\")",
+  "Balance": "xql.NewField[Account, float64](\"balance\", \"Balance\")",
+  "CreatedAt": "xql.NewField[Account, time.Time](\"created_at\", \"CreatedAt\")",
+  "UpdatedAt": "xql.NewField[Account, time.Time](\"updated_at\", \"UpdatedAt\")",
+  "CreatedBy": "xql.NewField[Account, string](\"created_by\", \"CreatedBy\")",
+  "UpdatedBy": "xql.NewField[Account, string](\"updated_by\", \"UpdatedBy\")"
+}
+

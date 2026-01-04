@@ -1,0 +1,10 @@
+{
+  "ID": "xql.NewField[Order, int64](\"id\", \"ID\")",
+  "AccountID": "xql.NewField[Order, int64](\"account_id\", \"AccountID\")",
+  "Amount": "xql.NewField[Order, float64](\"amount\", \"Amount\")",
+  "CreatedAt": "xql.NewField[Order, time.Time](\"created_at\", \"CreatedAt\")",
+  "UpdatedAt": "xql.NewField[Order, time.Time](\"updated_at\", \"UpdatedAt\")",
+  "CreatedBy": "xql.NewField[Order, string](\"created_by\", \"CreatedBy\")",
+  "UpdatedBy": "xql.NewField[Order, string](\"updated_by\", \"UpdatedBy\")"
+}
+

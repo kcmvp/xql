@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kcmvp/xql"
 	"github.com/kcmvp/xql/validator"
 	"github.com/samber/mo"
 	"github.com/stretchr/testify/require"
@@ -953,22 +954,22 @@ func TestSchemaField_validate(t *testing.T) {
 func TestWithFields(t *testing.T) {
 	tests := []struct {
 		name        string
-		fields      []FieldProvider
+		fields      []ViewField
 		shouldPanic bool
 	}{
 		{
 			name:        "no fields",
-			fields:      []FieldProvider{},
+			fields:      []ViewField{},
 			shouldPanic: false,
 		},
 		{
 			name:        "one field",
-			fields:      []FieldProvider{Field[string]("name")},
+			fields:      []ViewField{Field[string]("name")},
 			shouldPanic: false,
 		},
 		{
 			name: "multiple unique fields",
-			fields: []FieldProvider{
+			fields: []ViewField{
 				Field[string]("name"),
 				Field[int]("age"),
 			},
@@ -976,7 +977,7 @@ func TestWithFields(t *testing.T) {
 		},
 		{
 			name: "duplicate field name",
-			fields: []FieldProvider{
+			fields: []ViewField{
 				Field[string]("name"),
 				Field[int]("name"),
 			},
@@ -1830,5 +1831,42 @@ func TestSchema_Extend(t *testing.T) {
 
 		ac := schemaA.Extend(schemaC)
 		require.False(t, ac.allowUnknownFields)
+	})
+}
+
+// Tests for WrapField adapter (migrated from persistent_adapter_test.go)
+
+type dummyEntity struct{}
+
+func (dummyEntity) Table() string { return "dummy" }
+
+func TestWrapField_Basics(t *testing.T) {
+	f := xql.NewField[dummyEntity, string]("unit_price", "UnitPrice")
+	vf := WrapField[string](f)
+	require.NotNil(t, vf)
+	// QualifiedName should delegate to the persistent field
+	require.Equal(t, f.QualifiedName(), vf.QualifiedName())
+	// Name should be the last segment (view) -> "UnitPrice"
+	require.Equal(t, "UnitPrice", vf.Name())
+	// Scope should delegate
+	require.Equal(t, f.Scope(), vf.Scope())
+}
+
+func TestWrapField_Validators(t *testing.T) {
+	f := xql.NewField[dummyEntity, string]("username", "Username")
+	// Use a built-in validator factory
+	vf := WrapField[string](f, validator.MinLength(3))
+	// validateRaw should enforce min length
+	r := vf.validateRaw("ab")
+	require.True(t, r.IsError())
+	r = vf.validateRaw("abcd")
+	require.False(t, r.IsError())
+}
+
+func TestWrapField_TypeMismatchPanics(t *testing.T) {
+	f := xql.NewField[dummyEntity, string]("age", "Age")
+	// Attempt to wrap as int should panic
+	require.Panics(t, func() {
+		WrapField[int](f)
 	})
 }

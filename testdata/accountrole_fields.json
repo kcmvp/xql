@@ -7,4 +7,3 @@
   "CreatedBy": "xql.NewField[AccountRole, string](\"created_by\", \"CreatedBy\")",
   "UpdatedBy": "xql.NewField[AccountRole, string](\"updated_by\", \"UpdatedBy\")"
 }
-

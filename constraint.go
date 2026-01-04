@@ -3,6 +3,7 @@ package xql
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/mail"
 	"net/url"
 	"reflect"
@@ -373,7 +374,7 @@ func isLessThan[T Number | time.Time](a, b T) bool {
 // DefaultTimeLayouts are the default layouts used to parse time strings.
 var DefaultTimeLayouts = []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05", "2006-01-02"}
 
-// Decimal validates that a string representation of a decimal number conforms to
+// DecimalString validates that a string representation of a decimal number conforms to
 // the specified precision (total digits) and scale (fractional digits).
 // Behavior:
 //   - Empty string is considered valid (presence is handled elsewhere).
@@ -381,7 +382,7 @@ var DefaultTimeLayouts = []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15
 //   - Does not accept scientific notation (e.g., 1e3).
 //   - Counts digits from integer and fractional parts; total digits must be <= precision
 //     and fractional digits must be <= scale.
-func Decimal(precision, scale int) ValidateFunc[string] {
+func DecimalString(precision, scale int) ValidateFunc[string] {
 	return func() (string, Validator[string]) {
 		name := fmt.Sprintf("decimal(%d,%d)", precision, scale)
 		return name, func(s string) error {
@@ -415,6 +416,38 @@ func Decimal(precision, scale int) ValidateFunc[string] {
 			}
 			totalDigits := len(intPart) + len(fracPart)
 			if totalDigits > precision || len(fracPart) > scale {
+				return fmt.Errorf("%w %d,%d", ErrDecimalPrecision, precision, scale)
+			}
+			return nil
+		}
+	}
+}
+
+// Decimal validates numeric values (float32/float64) to conform to precision and scale.
+// It checks that the integer part has at most (precision - scale) digits and that the
+// fractional part has at most 'scale' decimal places. For floats we check fractional
+// places by scaling and ensuring the scaled value is an integer within a small epsilon.
+func Decimal[T float32 | float64](precision, scale int) ValidateFunc[T] {
+	return func() (string, Validator[T]) {
+		name := fmt.Sprintf("decimal(%d,%d)", precision, scale)
+		return name, func(v T) error {
+			vf := float64(v)
+			if math.IsNaN(vf) || math.IsInf(vf, 0) {
+				return fmt.Errorf("%w: invalid numeric", ErrDecimalPrecision)
+			}
+			// integer digit limit
+			intDigits := precision - scale
+			if intDigits < 1 {
+				intDigits = 1
+			}
+			absIntPart := math.Floor(math.Abs(vf))
+			if absIntPart >= math.Pow10(intDigits) {
+				return fmt.Errorf("%w %d,%d", ErrDecimalPrecision, precision, scale)
+			}
+			// fractional digits check: scale and allow small epsilon
+			scalePow := math.Pow10(scale)
+			scaled := vf * scalePow
+			if math.Abs(scaled-math.Round(scaled)) > 1e-9 {
 				return fmt.Errorf("%w %d,%d", ErrDecimalPrecision, precision, scale)
 			}
 			return nil

@@ -176,7 +176,7 @@ func TestSmokeValidatorsCompile(t *testing.T) {
 
 // Decimal validator tests (moved from constraint_decimal_test.go)
 func TestDecimalValidator_Valid(t *testing.T) {
-	vfn := Decimal(12, 2)
+	vfn := DecimalString(12, 2)
 	name, fn := vfn()
 	require.Equal(t, "decimal(12,2)", name)
 	req := []string{
@@ -193,7 +193,7 @@ func TestDecimalValidator_Valid(t *testing.T) {
 }
 
 func TestDecimalValidator_Invalid(t *testing.T) {
-	vfn := Decimal(5, 2)
+	vfn := DecimalString(5, 2)
 	_, fn := vfn()
 	cases := []string{
 		"1234.567",  // frac > 2

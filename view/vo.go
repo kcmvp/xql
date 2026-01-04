@@ -68,9 +68,13 @@ func (e *validationError) err() error {
 // ViewField is an internal, non-generic interface that allows Schema
 // to hold a collection of fields with different underlying generic types.
 //
-// This is intentionally view-layer specific (validation/parsing behavior) and
-// must not be confused with `dvo.Field`, which is persistence metadata.
+// This is view-layer specific (validation/parsing behavior) and should not
+// be confused with persistence metadata (for example types defined in `xql`).
 type ViewField interface {
+	// Persistence-related accessors (delegated to backing xql.Field when present)
+	Scope() string
+	QualifiedName() string
+	// View-specific accessors
 	Name() string
 	IsArray() bool
 	IsObject() bool
@@ -87,14 +91,15 @@ type JSONField[T validator.FieldType] struct {
 	object     bool
 	embedded   *Schema
 	validators []validator.Validator[T]
+	// persistent is an optional backing persistent xql.Field. It's private
+	// so view JSONFields do not expose persistence metadata publicly, but
+	// when present Scope()/QualifiedName() will delegate to it.
+	persistent xql.Field
 }
 
-func (f *JSONField[T]) AsSchemaField() ViewField {
-	return f
-}
-
-// seal makes the FieldProvider interface non-implementable by external packages.
-func (f *JSONField[T]) seal() {}
+// JSONField implements ViewField and optionally wraps a persistent `xql.Field`.
+// When wrapping a persistent field, `Scope()` and `QualifiedName()` delegate
+// to the backing field; otherwise the JSON/view name is used.
 
 func (f *JSONField[T]) Required() bool {
 	return f.required
@@ -113,10 +118,45 @@ func (f *JSONField[T]) embeddedObject() mo.Option[*Schema] {
 }
 
 var _ ViewField = (*JSONField[string])(nil)
-var _ FieldProvider = (*JSONField[string])(nil)
+
+// Note: ViewField is sealed via unexported methods, so only types defined in
+// this package implement it. Callers should pass ViewField values to
+// `WithFields` when constructing a Schema.
 
 func (f *JSONField[T]) Name() string {
+	// If this JSON field wraps a persistent xql.Field, return the last
+	// segment of the persistent QualifiedName (e.g. for "table.column.view"
+	// return "view"). This keeps the view key consistent with generated
+	// persistent-backed fields.
+	if f.persistent != nil {
+		q := f.persistent.QualifiedName()
+		if q == "" {
+			return f.name
+		}
+		if i := strings.LastIndex(q, "."); i != -1 {
+			return q[i+1:]
+		}
+		return q
+	}
 	return f.name
+}
+
+// Scope implements xql.Field.Scope for view fields. If a persistent backing
+// field was attached via WrapField, delegate to it; otherwise return empty.
+func (f *JSONField[T]) Scope() string {
+	if f.persistent != nil {
+		return f.persistent.Scope()
+	}
+	return ""
+}
+
+// QualifiedName implements xql.Field for view fields. If a persistent backing
+// field was attached, delegate; otherwise fall back to the view Name().
+func (f *JSONField[T]) QualifiedName() string {
+	if f.persistent != nil {
+		return f.persistent.QualifiedName()
+	}
+	return f.Name()
 }
 
 func (f *JSONField[T]) Optional() *JSONField[T] {
@@ -357,14 +397,6 @@ func overflowError[T any](v T) error {
 	return validator.OverflowError(v)
 }
 
-// FieldProvider is an interface for any type that can provide a ViewField.
-// It's used to create a type-safe and unified API for WithFields.
-// The unexported seal() method makes this interface non-implementable by external packages.
-type FieldProvider interface {
-	AsSchemaField() ViewField
-	seal()
-}
-
 // ObjectField creates a slice of SchemaField for a embeddedObject object.
 // It takes the name of the object field and a Schema representing its schema.
 // Each field in the embeddedObject Schema will be prefixed with the object's name.
@@ -422,19 +454,92 @@ func trait[T validator.FieldType](name string, isArray, isObject bool, nested *S
 	}
 }
 
+// WrapField wraps an existing persistent xql.Field into a view JSONField[T].
+// vfs are validator factory functions (validator.ValidateFunc[T]) which will
+// be converted to concrete validator.Validator[T] and attached to the returned
+// *JSONField[T]. The returned field will delegate Scope() / QualifiedName()
+// to the provided persistent field and use the persistent QualifiedName's
+// last segment as the JSON name (see JSONField.Name()).
+func WrapField[T validator.FieldType](f xql.Field, vfs ...validator.ValidateFunc[T]) *JSONField[T] {
+	if f == nil {
+		panic("view: WrapField requires a non-nil xql.Field")
+	}
+
+	var validators []validator.Validator[T]
+	// name set used to detect duplicate validator names across persistent and view validators
+	names := make(map[string]struct{})
+
+	// First, if the concrete field is a typed persistent field, include its validators
+	if pf, ok := f.(*xql.PersistentField[T]); ok {
+		for _, vf := range pf.Constraints() {
+			name, fn := vf()
+			// detect duplicates
+			if _, exists := names[name]; exists {
+				panic(fmt.Sprintf("dvo: duplicate validator '%s' from persistent field in WrapField", name))
+			}
+			names[name] = struct{}{}
+			// wrap xql.Validator[T] into view.validator.Validator[T]
+			fnLocal := fn
+			validators = append(validators, func(v T) error { return fnLocal(v) })
+		}
+	}
+
+	// Convert view-provided validator factory functions into concrete validators.
+	for _, vf := range vfs {
+		name, fn := vf()
+		if _, ok := names[name]; ok {
+			panic(fmt.Sprintf("dvo: duplicate validator '%s' in WrapField", name))
+		}
+		names[name] = struct{}{}
+		fnLocal := fn
+		validators = append(validators, func(v T) error { return fnLocal(v) })
+	}
+
+	// Enforce that the concrete field is a typed PersistentField. We require
+	// generated code to pass the exported *xql.PersistentField[T] so we can
+	// reliably reuse its validators; otherwise fail fast.
+	if _, ok := f.(*xql.PersistentField[T]); !ok {
+		var zero T
+		wantTypeName := reflect.TypeOf(zero).String()
+		panic(fmt.Sprintf("view: WrapField requires a *xql.PersistentField[%s] concrete field; got %T for %s", wantTypeName, f, f.QualifiedName()))
+	}
+
+	return &JSONField[T]{
+		name:       "", // name resolved from persistent QualifiedName in Name()
+		required:   true,
+		array:      false,
+		object:     false,
+		embedded:   nil,
+		validators: validators,
+		persistent: f,
+	}
+}
+
+// WrapFieldAsObject wraps an xql.Field as an embedded object field.
+func WrapFieldAsObject[T validator.FieldType](f xql.Field, vfs ...validator.ValidateFunc[T]) *JSONField[T] {
+	jf := WrapField[T](f, vfs...)
+	jf.object = true
+	return jf
+}
+
+// WrapFieldAsArray wraps an xql.Field as an array field.
+func WrapFieldAsArray[T validator.FieldType](f xql.Field, vfs ...validator.ValidateFunc[T]) *JSONField[T] {
+	jf := WrapField[T](f, vfs...)
+	jf.array = true
+	return jf
+}
+
 // Schema is a blueprint for validating a raw object.
 type Schema struct {
 	fields             []ViewField
 	allowUnknownFields bool
 }
 
-// WithFields is the new constructor for a Schema blueprint that accepts FieldProvider.
-// This allows for a more fluent and type-safe API.
-func WithFields(providers ...FieldProvider) *Schema {
-	fields := make([]ViewField, len(providers))
-	for i, p := range providers {
-		fields[i] = p.AsSchemaField()
-	}
+// WithFields constructs a Schema from the provided ViewField values.
+// It validates that field names are unique and returns a Schema ready for
+// validation operations.
+func WithFields(fields ...ViewField) *Schema {
+	// Defensive duplicate name check similar to previous behavior.
 	names := make(map[string]struct{})
 	for _, f := range fields {
 		if _, exists := names[f.Name()]; exists {
@@ -443,10 +548,6 @@ func WithFields(providers ...FieldProvider) *Schema {
 		names[f.Name()] = struct{}{}
 	}
 	return &Schema{fields: fields, allowUnknownFields: false}
-}
-
-func PersistentSchema(fields ...xql.PersistentField) *Schema {
-	panic("dvo: PersistentSchema is deprecated; use WithFields instead")
 }
 
 // AllowUnknownFields is a fluent method to make the Schema accept JSON/url params

@@ -9,4 +9,3 @@
   "CreatedBy": "xql.NewField[OrderItem, string](\"created_by\", \"CreatedBy\")",
   "UpdatedBy": "xql.NewField[OrderItem, string](\"updated_by\", \"UpdatedBy\")"
 }
-

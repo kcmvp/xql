@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -434,16 +435,48 @@ func generateFieldsFromMeta(metas []EntityMeta) error {
 			f := &fieldsCopy[i]
 			db := strings.TrimSpace(strings.ToLower(f.DBType))
 			var args []string
-			if f.GoType == "string" && db != "" {
-				if m := varcharRe.FindStringSubmatch(db); len(m) == 2 {
-					// varchar(N) -> MaxLength(N)
-					n := m[1]
-					args = append(args, fmt.Sprintf("%s.MaxLength(%s)", modulePkgName, n))
-				} else if m := decimalRe.FindStringSubmatch(db); len(m) == 3 {
-					// decimal(P,S) -> Decimal(P,S)
-					p := m[1]
-					s := m[2]
-					args = append(args, fmt.Sprintf("%s.Decimal(%s, %s)", modulePkgName, p, s))
+			if db != "" {
+				if f.GoType == "string" {
+					if m := varcharRe.FindStringSubmatch(db); len(m) == 2 {
+						// varchar(N) -> MaxLength(N)
+						n := m[1]
+						args = append(args, fmt.Sprintf("%s.MaxLength(%s)", modulePkgName, n))
+					} else if m := decimalRe.FindStringSubmatch(db); len(m) == 3 {
+						// decimal(P,S) -> Decimal(P,S) for string backing
+						p := m[1]
+						s := m[2]
+						args = append(args, fmt.Sprintf("%s.Decimal(%s, %s)", modulePkgName, p, s))
+					}
+				} else {
+					// for non-string types
+					if m := decimalRe.FindStringSubmatch(db); len(m) == 3 {
+						p, _ := strconv.Atoi(m[1])
+						s, _ := strconv.Atoi(m[2])
+						// if float type use generic Decimal[T]
+						switch f.GoType {
+						case "float32", "float64":
+							args = append(args, fmt.Sprintf("%s.Decimal[%s](%s, %s)", modulePkgName, f.GoType, m[1], m[2]))
+						default:
+							// integers / unsigned: compute integer max and emit Gte/Lte
+							intDigits := p - s
+							if intDigits < 1 {
+								intDigits = 1
+							}
+							maxInt := int64(1)
+							for k := 0; k < intDigits; k++ {
+								maxInt *= 10
+							}
+							maxInt = maxInt - 1
+							switch f.GoType {
+							case "int", "int8", "int16", "int32", "int64":
+								args = append(args, fmt.Sprintf("%s.Gte[%s](%d)", modulePkgName, f.GoType, -maxInt))
+								args = append(args, fmt.Sprintf("%s.Lte[%s](%d)", modulePkgName, f.GoType, maxInt))
+							case "uint", "uint8", "uint16", "uint32", "uint64":
+								args = append(args, fmt.Sprintf("%s.Gte[%s](%d)", modulePkgName, f.GoType, 0))
+								args = append(args, fmt.Sprintf("%s.Lte[%s](%d)", modulePkgName, f.GoType, maxInt))
+							}
+						}
+					}
 				}
 			}
 			if len(args) > 0 {
