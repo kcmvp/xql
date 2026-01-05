@@ -148,17 +148,228 @@ type EntityMeta struct {
 	Fields     []Field // adapter-agnostic field info (no DBType)
 }
 
+// OutputWriter abstracts file writing so generation can be directed to disk or memory (tests).
+type OutputWriter interface {
+	MkdirAll(path string, perm os.FileMode) error
+	WriteFile(path string, data []byte, perm os.FileMode) error
+}
+
+// DiskWriter writes files to the real filesystem.
+type DiskWriter struct{}
+
+func (DiskWriter) MkdirAll(path string, perm os.FileMode) error {
+	return os.MkdirAll(path, perm)
+}
+
+func (DiskWriter) WriteFile(path string, data []byte, perm os.FileMode) error {
+	return os.WriteFile(path, data, perm)
+}
+
+// MemoryWriter captures written files in-memory (map[path]content).
+// Useful for tests to avoid mutating the repository.
+type MemoryWriter struct {
+	Files map[string][]byte
+}
+
+func NewMemoryWriter() *MemoryWriter {
+	return &MemoryWriter{Files: map[string][]byte{}}
+}
+
+func (m *MemoryWriter) MkdirAll(path string, perm os.FileMode) error {
+	// no-op for memory
+	return nil
+}
+
+func (m *MemoryWriter) WriteFile(path string, data []byte, perm os.FileMode) error {
+	m.Files[path] = append([]byte(nil), data...)
+	return nil
+}
+
+// generateWithWriter runs generation and writes outputs using the provided OutputWriter.
+// It returns the in-memory map when a *MemoryWriter is used, otherwise nil.
+func generateWithWriter(ctx context.Context, w OutputWriter) (map[string][]byte, error) {
+	project := internal.Current
+	if project == nil {
+		return nil, fmt.Errorf("project context not initialized")
+	}
+
+	adapters, ok := ctx.Value(dbaAdapterKey).([]string)
+	if !ok || len(adapters) == 0 {
+		return nil, fmt.Errorf("no database adapters are configured or detected")
+	}
+
+	// entity filter may be provided in context
+	// NOTE: generation-side filtering is handled inside generateMeta by reading
+	// ctx.Value(entityFilterKey). The local entityFilter variable here was
+	// redundant and caused a compile error by being unused; removed.
+
+	// metas, err := buildEntityMeta(ctx, entityFilter)
+	metas, err := generateMeta(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// prepare templates
+	fieldTmpl, err := template.New("fields").Funcs(template.FuncMap{
+		"ago": func(t time.Time) string { return t.Format(time.RFC3339) },
+	}).Parse(fieldsTmpl)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse fields template: %w", err)
+	}
+	funcMap := template.FuncMap{
+		"plus1": func(i int) int { return i + 1 },
+	}
+	schemaTmplParsed, err := template.New("schema").Funcs(funcMap).Parse(schemaTmpl)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse schema template: %w", err)
+	}
+
+	// precompile regexes
+	varcharRe := regexp.MustCompile(`(?i)^varchar\((\d+)\)`)                                  // capture length
+	decimalRe := regexp.MustCompile(`(?i)^(?:decimal|numeric)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)`) // capture precision,scale
+
+	for _, meta := range metas {
+		imports := buildImports(meta)
+
+		// compute module package name heuristically: try to load package to get declared name,
+		// fall back to last path element if load fails.
+		modulePkgName := path.Base(internal.ToolModulePath())
+		if pkgs, _ := packages.Load(&packages.Config{Mode: packages.NeedName}, internal.ToolModulePath()); len(pkgs) > 0 {
+			if pkgs[0].Name != "" {
+				modulePkgName = pkgs[0].Name
+			}
+		}
+
+		// make a copy of fields so we can annotate ValidatorArgs per-field
+		fieldsCopy := make([]Field, len(meta.Fields))
+		copy(fieldsCopy, meta.Fields)
+
+		// build validator args based on DBType
+		for i := range fieldsCopy {
+			f := &fieldsCopy[i]
+			db := strings.TrimSpace(strings.ToLower(f.DBType))
+			var args []string
+			if db != "" {
+				if f.GoType == "string" {
+					if m := varcharRe.FindStringSubmatch(db); len(m) == 2 {
+						n := m[1]
+						args = append(args, fmt.Sprintf("%s.MaxLength(%s)", modulePkgName, n))
+					} else if m := decimalRe.FindStringSubmatch(db); len(m) == 3 {
+						p := m[1]
+						s := m[2]
+						args = append(args, fmt.Sprintf("%s.Decimal(%s, %s)", modulePkgName, p, s))
+					}
+				} else {
+					if m := decimalRe.FindStringSubmatch(db); len(m) == 3 {
+						p, _ := strconv.Atoi(m[1])
+						s, _ := strconv.Atoi(m[2])
+						switch f.GoType {
+						case "float32", "float64":
+							args = append(args, fmt.Sprintf("%s.Decimal[%s](%s, %s)", modulePkgName, f.GoType, m[1], m[2]))
+						default:
+							intDigits := p - s
+							if intDigits < 1 {
+								intDigits = 1
+							}
+							maxInt := int64(1)
+							for k := 0; k < intDigits; k++ {
+								maxInt *= 10
+							}
+							maxInt = maxInt - 1
+							switch f.GoType {
+							case "int", "int8", "int16", "int32", "int64":
+								args = append(args, fmt.Sprintf("%s.Gte[%s](%d)", modulePkgName, f.GoType, -maxInt))
+								args = append(args, fmt.Sprintf("%s.Lte[%s](%d)", modulePkgName, f.GoType, maxInt))
+							case "uint", "uint8", "uint16", "uint32", "uint64":
+								args = append(args, fmt.Sprintf("%s.Gte[%s](%d)", modulePkgName, f.GoType, 0))
+								args = append(args, fmt.Sprintf("%s.Lte[%s](%d)", modulePkgName, f.GoType, maxInt))
+							}
+						}
+					}
+				}
+			}
+			if len(args) > 0 {
+				f.ValidatorArgs = ", " + strings.Join(args, ", ")
+			} else {
+				f.ValidatorArgs = ""
+			}
+		}
+
+		data := TemplateData{
+			PackageName:      strings.ToLower(meta.StructName),
+			StructName:       meta.StructName,
+			Imports:          imports,
+			Fields:           fieldsCopy,
+			ModulePath:       internal.ToolModulePath(),
+			ModulePkgName:    modulePkgName,
+			EntityImportPath: meta.PkgPath,
+			GeneratedAt:      time.Now(),
+			Version:          computeEntityVersion(meta),
+		}
+
+		// render fields template
+		var buf bytes.Buffer
+		if err := fieldTmpl.Execute(&buf, data); err != nil {
+			return nil, fmt.Errorf("failed to execute template for %s: %w", meta.StructName, err)
+		}
+		formatted, err := format.Source(buf.Bytes())
+		if err != nil {
+			return nil, fmt.Errorf("failed to format generated code for %s: %w", meta.StructName, err)
+		}
+		outputDir := filepath.Join(project.GenPath(), "field", data.PackageName)
+		if err := w.MkdirAll(outputDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create output directory %s: %w", outputDir, err)
+		}
+		outputPath := filepath.Join(outputDir, fmt.Sprintf("%s_gen.go", data.PackageName))
+		if err := w.WriteFile(outputPath, formatted, 0644); err != nil {
+			return nil, fmt.Errorf("failed to write generated file for %s: %w", meta.StructName, err)
+		}
+
+		// render schemas for adapters
+		for _, adapter := range adapters {
+			fields := enrichFieldsForAdapter(meta.Fields, adapter)
+			if len(fields) == 0 {
+				continue
+			}
+			data := SchemaTemplateData{
+				TableName:   meta.TableName,
+				Fields:      fields,
+				GeneratedAt: time.Now(),
+				Version:     computeEntityVersion(meta),
+			}
+			var sb bytes.Buffer
+			if err := schemaTmplParsed.Execute(&sb, data); err != nil {
+				return nil, fmt.Errorf("failed to execute schema template for %s: %w", meta.StructName, err)
+			}
+			outputDir := filepath.Join(project.GenPath(), "schemas", adapter)
+			if err := w.MkdirAll(outputDir, 0755); err != nil {
+				return nil, fmt.Errorf("failed to create output directory %s: %w", outputDir, err)
+			}
+			outputPath := filepath.Join(outputDir, fmt.Sprintf("%s_schema.sql", lo.SnakeCase(meta.StructName)))
+			if err := w.WriteFile(outputPath, sb.Bytes(), 0644); err != nil {
+				return nil, fmt.Errorf("failed to write generated schema for %s: %w", meta.StructName, err)
+			}
+		}
+	}
+
+	// If writer is a MemoryWriter, return its files for test inspection
+	if mw, ok := w.(*MemoryWriter); ok {
+		return mw.Files, nil
+	}
+	return nil, nil
+}
+
+// generateToMemory runs the generation and returns generated files in-memory.
+func generateToMemory(ctx context.Context) (map[string][]byte, error) {
+	mw := NewMemoryWriter()
+	return generateWithWriter(ctx, mw)
+}
+
 // generate is the single entrypoint for this package's generation workflow.
 // It builds entity metadata once, then generates both field helpers and schemas.
 func generate(ctx context.Context) error {
-	meta, err := generateMeta(ctx)
-	if err != nil {
-		return err
-	}
-	if err := generateFieldsFromMeta(meta); err != nil {
-		return err
-	}
-	return generateSchemaFromMeta(ctx, meta)
+	_, err := generateWithWriter(ctx, DiskWriter{})
+	return err
 }
 
 // generateMeta builds a consistent metadata model from source code exactly once.
@@ -860,3 +1071,19 @@ func computeEntityVersion(meta EntityMeta) string {
 }
 
 var _ = errors.New
+
+func buildImports(meta EntityMeta) []string {
+	imports := lo.Uniq(lo.FilterMap(meta.Fields, func(f Field, _ int) (string, bool) {
+		if strings.Contains(f.GoType, ".") {
+			pkg := strings.Split(f.GoType, ".")[0]
+			switch pkg {
+			case "time":
+				return "time", true
+			default:
+				return "", false
+			}
+		}
+		return "", false
+	}))
+	return imports
+}

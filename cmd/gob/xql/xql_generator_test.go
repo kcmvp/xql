@@ -70,17 +70,63 @@ func compareGoFileWithJSON(t *testing.T, goFilePath, jsonFilePath string) {
 	require.Equal(t, expectedFields, filtered)
 }
 
-func compareFiles(t *testing.T, generatedFilePath, testDataFilePath string) {
-	generatedContent, err := os.ReadFile(generatedFilePath)
+// compareInMemoryWithJSON compares an in-memory generated Go file (from map) with expected JSON field list
+func compareInMemoryWithJSON(t *testing.T, generated map[string][]byte, goPath, jsonPath string) {
+	content, ok := generated[goPath]
+	require.True(t, ok, "generated content missing for %s", goPath)
+
+	// Parse the Go content
+	fset := token.NewFileSet()
+	node, err := parser.ParseFile(fset, "", content, parser.ParseComments)
 	require.NoError(t, err)
 
-	testDataContent, err := os.ReadFile(testDataFilePath)
+	fields := make(map[string]string)
+	ast.Inspect(node, func(n ast.Node) bool {
+		if vs, ok := n.(*ast.ValueSpec); ok {
+			for _, name := range vs.Names {
+				if len(vs.Values) > 0 {
+					start := vs.Values[0].Pos() - 1
+					end := vs.Values[0].End() - 1
+					if int(start) < len(content) && int(end) < len(content) {
+						fields[name.Name] = string(content[start:end])
+					}
+				}
+			}
+		}
+		return true
+	})
+
+	jsonContent, err := os.ReadFile(jsonPath)
 	require.NoError(t, err)
 
-	if cleanSQL(string(testDataContent)) != cleanSQL(string(generatedContent)) {
-		t.Log("Generated file content:\n", string(generatedContent))
+	var expected map[string]string
+	if len(jsonContent) == 0 {
+		expected = map[string]string{}
+	} else {
+		require.NoError(t, json.Unmarshal(jsonContent, &expected))
 	}
-	require.Equal(t, cleanSQL(string(testDataContent)), cleanSQL(string(generatedContent)))
+
+	filtered := make(map[string]string, len(fields))
+	for k, v := range fields {
+		if strings.HasPrefix(k, "View") {
+			continue
+		}
+		filtered[k] = v
+	}
+
+	require.Equal(t, expected, filtered)
+}
+
+// compareInMemoryWithFiles compares in-memory generated content with on-disk file content using cleanSQL
+func compareInMemoryWithFiles(t *testing.T, generated map[string][]byte, generatedPath, expectedFile string) {
+	content, ok := generated[generatedPath]
+	require.True(t, ok, "generated content missing for %s", generatedPath)
+	expectedContent, err := os.ReadFile(expectedFile)
+	require.NoError(t, err)
+	if cleanSQL(string(expectedContent)) != cleanSQL(string(content)) {
+		t.Logf("Generated content for %s differs:\n%s", generatedPath, string(content))
+	}
+	require.Equal(t, cleanSQL(string(expectedContent)), cleanSQL(string(content)))
 }
 
 func cleanSQL(content string) string {
@@ -106,19 +152,20 @@ func TestGeneration(t *testing.T) {
 	}
 	ctx = context.WithValue(ctx, entityFilterKey, filter)
 
-	err := generate(ctx)
+	// Generate to memory to avoid touching disk in tests
+	generated, err := generateToMemory(ctx)
 	require.NoError(t, err)
 
 	testDataDir := filepath.Join(internal.Current.Root, "testdata")
 
 	// Verify the output for Account fields
-	compareGoFileWithJSON(t,
+	compareInMemoryWithJSON(t, generated,
 		filepath.Join(internal.Current.GenPath(), "field", "account", "account_gen.go"),
 		filepath.Join(testDataDir, "account_fields.json"),
 	)
 
 	// Verify the output for Order fields
-	compareGoFileWithJSON(t,
+	compareInMemoryWithJSON(t, generated,
 		filepath.Join(internal.Current.GenPath(), "field", "order", "order_gen.go"),
 		filepath.Join(testDataDir, "order_fields.json"),
 	)
@@ -133,8 +180,8 @@ func TestGeneration(t *testing.T) {
 			pkg := e.Name()
 			goFile := filepath.Join(genFieldDir, pkg, pkg+"_gen.go")
 			jsonFile := filepath.Join(testDataDir, pkg+"_fields.json")
-			// ensure files exist and match; compareGoFileWithJSON will assert
-			compareGoFileWithJSON(t, goFile, jsonFile)
+			// ensure files exist and match; compareInMemoryWithJSON will assert
+			compareInMemoryWithJSON(t, generated, goFile, jsonFile)
 		}
 	} else {
 		t.Fatalf("failed to read generated field dir: %v", err)
@@ -142,11 +189,11 @@ func TestGeneration(t *testing.T) {
 
 	// Verify the output for schemas
 	for _, db := range []string{"sqlite", "postgres", "mysql"} {
-		compareFiles(t,
+		compareInMemoryWithFiles(t, generated,
 			filepath.Join(internal.Current.GenPath(), "schemas", db, "account_schema.sql"),
 			filepath.Join(testDataDir, "schemas", db, "account_schema.sql"),
 		)
-		compareFiles(t,
+		compareInMemoryWithFiles(t, generated,
 			filepath.Join(internal.Current.GenPath(), "schemas", db, "order_schema.sql"),
 			filepath.Join(testDataDir, "schemas", db, "order_schema.sql"),
 		)
