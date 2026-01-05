@@ -96,7 +96,7 @@ func (f *PersistentField[E]) QualifiedName() string {
 	return fmt.Sprintf("%s.%s.%s", f.table, f.column, f.view)
 }
 
-// ViewName returns the view (JSON key) part of the persistent field.
+// View ViewName returns the view (JSON key) part of the persistent field.
 func (f *PersistentField[E]) View() string {
 	return f.view
 }

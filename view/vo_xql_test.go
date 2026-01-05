@@ -133,39 +133,32 @@ func TestValueObject_BackendQualifiedKeys_HappyPath(t *testing.T) {
 	s := WithXQLFields(acct.Email, acct.Nickname, ord.Amount, oi.UnitPrice)
 
 	// Use JSON with view names (Name()) as keys
-	json := fmt.Sprintf(`{"%s":"bob@example.com","%s":"Bobby","%s":250.5,"%s":19.95}`,
+	jsonStr := fmt.Sprintf(`{"%s":"bob@example.com","%s":"Bobby","%s":250.5,"%s":19.95}`,
 		WrapField[string](acct.Email).Name(),
 		WrapField[string](acct.Nickname).Name(),
 		WrapField[float64](ord.Amount).Name(),
 		WrapField[float64](oi.UnitPrice).Name(),
 	)
 
-	res := s.Validate(json)
+	res := s.Validate(jsonStr)
 	require.False(t, res.IsError(), "validation should succeed")
 	vo := res.MustGet()
 
-	// Convert to backend map keyed by QualifiedName()
-	backend := make(map[string]any)
-	for _, f := range s.fields {
-		// use the view name to retrieve value from vo
-		name := f.Name()
-		valOpt := vo.Get(name)
-		if !valOpt.IsPresent() {
-			// missing optional fields are OK
-			continue
-		}
-		v := valOpt.MustGet()
-		backend[f.QualifiedName()] = v
-	}
+	// Unmarshal the JSON string to obtain expected values keyed by view name
+	var expected map[string]any
+	require.NoError(t, json.Unmarshal([]byte(jsonStr), &expected))
 
-	// Check backend map has entries keyed by QualifiedName
+	// For every field in the schema, ensure the validated ValueObject contains
+	// a value under the field's UniqueName() and that it equals the value from
+	// the original JSON (view name key).
 	for _, f := range s.fields {
-		val, ok := backend[f.QualifiedName()]
-		require.True(t, ok, "backend key %s must exist", f.QualifiedName())
-		// Also assert the stored value equals the one in the ValueObject via Name()
-		name := f.Name()
-		voVal := vo.Get(name).MustGet()
-		require.Equal(t, voVal, val)
+		exp, ok := expected[f.Name()]
+		require.True(t, ok, "test JSON must contain key %s", f.Name())
+
+		valOpt := vo.Get(f.UniqueName())
+		require.True(t, valOpt.IsPresent(), "expected value present for %s (unique: %s)", f.Name(), f.UniqueName())
+		got := valOpt.MustGet()
+		require.Equal(t, exp, got)
 	}
 }
 
@@ -203,24 +196,16 @@ func TestValidate_WithXQLFields_FromTestdata_ProducesQualifiedKeys(t *testing.T)
 	require.False(t, res.IsError(), "expected validation to succeed")
 	vo := res.MustGet()
 
-	// Also assert directly that the Email value can be retrieved via the view name
-	//emailName := WrapField[string](acct.Email).Name()
-	emailName := acct.Email.View()
-	emailOpt := vo.Get(emailName)
-	require.True(t, emailOpt.IsPresent(), "expected Email to be present in ValueObject via Name()")
-	require.Equal(t, "bob@example.com", emailOpt.MustGet())
-
-	// The current implementation stores values keyed by the view Name() (the
-	// last segment of QualifiedName) which may differ from the original field
-	// QualifiedName if a schema is involved. This test ensures the stored value
-	// can be retrieved using the view name and matches the testdata.
+	// The testdata file contains keys using the view names (last segment). Ensure
+	// that values stored under the field's UniqueName() match the expected values
+	// from the testdata.
 	var m map[string]any
 	require.NoError(t, json.Unmarshal(jsonData, &m))
 	for _, f := range s.fields {
 		viewName := f.Name()
 		exp, ok := m[viewName]
 		require.True(t, ok, "expected testdata to contain key %s", viewName)
-		valOpt := vo.Get(viewName)
+		valOpt := vo.Get(f.UniqueName())
 		require.True(t, valOpt.IsPresent(), "expected value for %s", viewName)
 		require.Equal(t, exp, valOpt.MustGet())
 	}
