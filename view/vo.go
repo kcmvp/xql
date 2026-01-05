@@ -12,6 +12,7 @@ import (
 
 	"github.com/kcmvp/xql"
 	"github.com/kcmvp/xql/internal"
+	"github.com/kcmvp/xql/sqlx"
 	"github.com/kcmvp/xql/validator"
 	"github.com/samber/lo"
 	"github.com/samber/mo"
@@ -76,6 +77,7 @@ type ViewField interface {
 	QualifiedName() string
 	// Name View-specific accessors
 	Name() string
+	UniqueName() string
 	IsArray() bool
 	IsObject() bool
 	Required() bool
@@ -146,6 +148,16 @@ func (f *JSONField[T]) Scope() string {
 // QualifiedName returns the stored qualifiedName for the view field.
 func (f *JSONField[T]) QualifiedName() string {
 	return f.qualifiedName
+}
+
+// UniqueName returns the canonical storage key for this field. For persistent-backed
+// fields this is the full qualified name (e.g. "table.column.view"). For view-only
+// fields it falls back to the view key.
+func (f *JSONField[T]) UniqueName() string {
+	if f.qualifiedName != "" {
+		return f.qualifiedName
+	}
+	return f.Name()
 }
 
 func (f *JSONField[T]) Optional() *JSONField[T] {
@@ -519,6 +531,18 @@ func WithFields(fields ...ViewField) *Schema {
 		}
 		names[f.Name()] = struct{}{}
 	}
+	// New: ensure QualifiedName uniqueness for fields that provide one.
+	qnames := make(map[string]struct{})
+	for _, f := range fields {
+		qn := f.QualifiedName()
+		if qn == "" {
+			continue
+		}
+		if _, exists := qnames[qn]; exists {
+			panic(fmt.Sprintf("dvo: duplicate qualified name '%s' in Schema definition", qn))
+		}
+		qnames[qn] = struct{}{}
+	}
 	return &Schema{fields: fields, allowUnknownFields: false}
 }
 
@@ -724,6 +748,51 @@ func setObjectField(object internal.Data, key string, val any) {
 	}
 }
 
+// setNestedField stores val into object under a dotted path key like "a.b.c".
+// It will create nested internal.Data maps as needed. For the final value it
+// uses setObjectField to normalize ValueObject/map types.
+func setNestedField(object internal.Data, key string, val any) {
+	parts := strings.Split(key, ".")
+	if len(parts) == 0 {
+		return
+	}
+	cur := object
+	for i := 0; i < len(parts)-1; i++ {
+		p := parts[i]
+		// if existing value is a Data, descend
+		if next, ok := cur[p]; ok {
+			if m, ok := next.(internal.Data); ok {
+				cur = m
+				continue
+			}
+			// If existing value is a ValueObject, attempt to extract its Data
+			if vo, ok := next.(ValueObject); ok {
+				// Convert ValueObject to internal.Data by marshaling/getting Fields
+				inner := internal.Data{}
+				for _, k := range vo.Fields() {
+					if opt := vo.Get(k); opt.IsPresent() {
+						inner[k] = opt.MustGet()
+					}
+				}
+				cur[p] = inner
+				cur = inner
+				continue
+			}
+			// If it's neither a map nor a ValueObject, overwrite with a new map
+			m := internal.Data{}
+			cur[p] = m
+			cur = m
+		} else {
+			m := internal.Data{}
+			cur[p] = m
+			cur = m
+		}
+	}
+	// final part
+	final := parts[len(parts)-1]
+	setObjectField(cur, final, val)
+}
+
 func (s *Schema) Validate(json string, urlParams ...map[string]string) mo.Result[ValueObject] {
 	if len(json) > 0 && !gjson.Valid(json) {
 		return mo.Err[ValueObject](fmt.Errorf("invalid json %s", json))
@@ -802,12 +871,11 @@ func (s *Schema) Validate(json string, urlParams ...map[string]string) mo.Result
 		// Store the validated value as-is. For embedded objects the validate()
 		// returns a ValueObject, so we keep it to preserve hierarchical access.
 		val := rs.MustGet()
-		key := field.Name()
-		if field.IsObject() && !field.IsArray() {
-			setObjectField(object, key, val)
-		} else {
-			object[key] = val
-		}
+		// Use UniqueName() as the storage key so view validation maps back to
+		// persistent field identifiers when available.
+		key := field.UniqueName()
+		// Store into nested map structure to support dot-path lookups via internal.Get
+		setNestedField(object, key, val)
 	}
 
 	// Add unknown URL parameters to the final object if allowed.
@@ -821,4 +889,25 @@ func (s *Schema) Validate(json string, urlParams ...map[string]string) mo.Result
 	return lo.Ternary(errs.err() != nil, mo.Err[ValueObject](errs.err()), mo.Ok[ValueObject](valueObject{
 		Data: object,
 	}))
+}
+
+// ToSQLXValueObject converts a view.ValueObject (validated by a Schema)
+// into a sqlx.ValueObject suitable for the sqlx package. It copies all
+// top-level fields from the view.ValueObject into a new internal.Data map
+// and returns sqlx.NewValueObject(map).
+//
+// Note: view.ValueObject may store nested objects under top-level keys
+// (for dotted qualified names). This function preserves those nested maps
+// so sqlx/internal.Gets dot-path traversal continues to work.
+func ToSQLXValueObject(vo ValueObject) sqlx.ValueObject {
+	if vo == nil {
+		return sqlx.NewValueObject(nil)
+	}
+	m := internal.Data{}
+	for _, k := range vo.Fields() {
+		if opt := vo.Get(k); opt.IsPresent() {
+			m[k] = opt.MustGet()
+		}
+	}
+	return sqlx.NewValueObject(m)
 }
