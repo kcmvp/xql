@@ -1367,10 +1367,10 @@ func TestValueObject_AddUpdate(t *testing.T) {
 		require.Equal(t, "gopher", name)
 
 		// Test panic on duplicate key
-		require.PanicsWithValue(t, "assertion failed: dvo: property 'name' already exists", func() {
+		require.PanicsWithValue(t, "assertion failed: xql: property 'name' already exists", func() {
 			vo.Add("name", "another-gopher")
 		})
-		require.PanicsWithValue(t, "assertion failed: dov: property 'a.d' contains '.'", func() {
+		require.PanicsWithValue(t, "assertion failed: xql: property 'a.d' contains '.'", func() {
 			vo.Add("a.d", "another-gopher")
 		})
 	})
@@ -1389,7 +1389,7 @@ func TestValueObject_AddUpdate(t *testing.T) {
 		require.Equal(t, "gopher-updated", name)
 
 		// Test panic on non-existent key
-		require.PanicsWithValue(t, "dvo: property 'age' does not exist", func() {
+		require.PanicsWithValue(t, "xql: property 'age' does not exist", func() {
 			vo.Update("age", 30)
 		})
 	})
@@ -1455,13 +1455,13 @@ func TestValueObject_MustMethods(t *testing.T) {
 
 func TestField_PanicOnInvalidName(t *testing.T) {
 	t.Run("invalid name with dot", func(t *testing.T) {
-		require.PanicsWithValue(t, "dvo: field name 'user.name' cannot contain '.' or '#'", func() {
+		require.PanicsWithValue(t, "xql: field name 'user.name' cannot contain '.' or '#'", func() {
 			Field[string]("user.name")
 		})
 	})
 
 	t.Run("invalid name with hash", func(t *testing.T) {
-		require.PanicsWithValue(t, "dvo: field name 'user#name' cannot contain '.' or '#'", func() {
+		require.PanicsWithValue(t, "xql: field name 'user#name' cannot contain '.' or '#'", func() {
 			Field[string]("user#name")
 		})
 	})
@@ -1469,7 +1469,7 @@ func TestField_PanicOnInvalidName(t *testing.T) {
 
 func TestField_PanicOnDuplicateValidator(t *testing.T) {
 	t.Run("duplicate validator", func(t *testing.T) {
-		require.PanicsWithValue(t, "dvo: duplicate validator 'min_length' for field 'password'", func() {
+		require.PanicsWithValue(t, "xql: duplicate validator 'min_length' for field 'password'", func() {
 			Field[string]("password", validator.MinLength(5), validator.MinLength(10))
 		})
 	})
@@ -1615,11 +1615,9 @@ func TestNestedValidation(t *testing.T) {
 			jsonFile: "nested_valid.json",
 			isValid:  true,
 			check: func(t *testing.T, vo ValueObject) {
-				require.PanicsWithValue(t,
-					"assertion failed: dvo: path part 'not-an-index' in 'tags.not-an-index' is not a valid integer index for a slice",
-					func() {
-						vo.Get("tags.not-an-index")
-					})
+				require.PanicsWithValue(t, "assertion failed: xql: path part 'not-an-index' in 'tags.not-an-index' is not a valid integer index for a slice", func() {
+					vo.Get("tags.not-an-index")
+				})
 			},
 		},
 		{
@@ -1627,11 +1625,9 @@ func TestNestedValidation(t *testing.T) {
 			jsonFile: "nested_valid.json",
 			isValid:  true,
 			check: func(t *testing.T, vo ValueObject) {
-				require.PanicsWithValue(t,
-					"assertion failed: dvo: array bound exceed: [go dvo testing]",
-					func() {
-						vo.Get("tags.3")
-					})
+				require.PanicsWithValue(t, "assertion failed: xql: array bound exceed: [go dvo testing]", func() {
+					vo.Get("tags.3")
+				})
 			},
 		},
 		{
@@ -1810,7 +1806,7 @@ func TestSchema_Extend(t *testing.T) {
 		conflictingSchema := WithFields(
 			Field[string]("id"), // Duplicate field
 		)
-		require.PanicsWithValue(t, "dvo: duplicate field name 'id' found during Extend", func() {
+		require.PanicsWithValue(t, "xql: duplicate field name 'id' found during Extend", func() {
 			baseSchema.Extend(conflictingSchema)
 		})
 	})
@@ -1839,7 +1835,7 @@ func TestSchema_Extend(t *testing.T) {
 	})
 }
 
-// Tests for WrapField adapter (migrated from persistent_adapter_test.go)
+// Tests for persistentField adapter (migrated from persistent_adapter_test.go)
 
 type dummyEntity struct{}
 
@@ -1847,7 +1843,7 @@ func (dummyEntity) Table() string { return "dummy" }
 
 func TestWrapField_Basics(t *testing.T) {
 	f := xql.NewField[dummyEntity, string]("unit_price", "UnitPrice")
-	vf := WrapField[string](f)
+	vf := PersistentField[string](f)
 	require.NotNil(t, vf)
 	// QualifiedName should delegate to the persistent field
 	require.Equal(t, f.QualifiedName(), vf.QualifiedName())
@@ -1860,7 +1856,7 @@ func TestWrapField_Basics(t *testing.T) {
 func TestWrapField_Validators(t *testing.T) {
 	f := xql.NewField[dummyEntity, string]("username", "Username")
 	// Use a built-in validator factory
-	vf := WrapField[string](f, validator.MinLength(3))
+	vf := PersistentField[string](f, validator.MinLength(3))
 	// validateRaw should enforce min length
 	r := vf.validateRaw("ab")
 	require.True(t, r.IsError())
