@@ -439,8 +439,8 @@ func TestSqlGeneration_Update(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			valuesVO := NewValueObject(map[string]any{"__schema": schema})
-			exec := Update[Order](valuesVO)(c.where)
+			// pass schema explicitly to Update
+			exec := Update[Order](schema, nil)(c.where)
 			require.NotNil(t, exec)
 
 			q, err := exec.sql()
@@ -493,8 +493,8 @@ func TestSqlGeneration_Update(t *testing.T) {
 
 	for _, c := range complexCases {
 		t.Run(c.name, func(t *testing.T) {
-			valuesVO := NewValueObject(map[string]any{"__schema": schema})
-			exec := Update[Order](valuesVO)(c.where)
+			// pass schema explicitly to Update
+			exec := Update[Order](schema, nil)(c.where)
 			require.NotNil(t, exec)
 
 			q, err := exec.sql()
@@ -550,9 +550,8 @@ func TestJoinAPIs_SQLGeneration(t *testing.T) {
 	})
 
 	t.Run("UpdateJoin", func(t *testing.T) {
-		// values can be nil for SQL generation test; provide __schema for updateSQLFromValues
-		valuesVO := NewValueObject(map[string]any{"__schema": schema})
-		exec := UpdateJoin[Order](valuesVO)(join, nil)
+		// values can be nil for SQL generation test; provide schema explicitly
+		exec := UpdateJoin[Order](schema, nil)(join, nil)
 		require.NotNil(t, exec)
 		q, err := exec.sql()
 		require.NoError(t, err)
@@ -560,4 +559,33 @@ func TestJoinAPIs_SQLGeneration(t *testing.T) {
 		require.True(t, strings.HasPrefix(strings.TrimSpace(q), "UPDATE orders"), "unexpected update prefix: %s", q)
 		require.True(t, strings.Contains(q, "EXISTS (SELECT 1 FROM profiles WHERE profiles.account_id = orders.account_id"), "exists subquery missing in update: %s", q)
 	})
+}
+
+func TestMapValueObject(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload map[string]any
+		wantP   bool
+		wantKey string
+	}{
+		{name: "validKey", payload: map[string]any{"accounts.email": "user@example.com"}, wantP: false, wantKey: "accounts.email"},
+		{name: "missingDot", payload: map[string]any{"accounts": 1}, wantP: true},
+		{name: "emptyKey", payload: map[string]any{"": "empty"}, wantP: true},
+		{name: "singlePartWithDotAtEnd", payload: map[string]any{"accounts.": 2}, wantP: false, wantKey: "accounts."},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.wantP {
+				require.Panics(t, func() { MapValueObject(FlatMap(tc.payload)) })
+				return
+			}
+			vo := MapValueObject(FlatMap(tc.payload))
+			require.NotNil(t, vo)
+			require.Contains(t, vo.Fields(), tc.wantKey)
+			op := vo.Get(tc.wantKey)
+			require.True(t, op.IsPresent())
+			require.Equal(t, tc.payload[tc.wantKey], op.MustGet())
+		})
+	}
 }

@@ -17,40 +17,40 @@ import (
 )
 
 func TestWrapFieldAndWithXQLFields_Basics(t *testing.T) {
-	// Choose a few generated persistent fields and verify WrapField behavior
+	// Choose a few generated persistent fields and verify persistentField behavior
 	fEmail := acct.Email
-	vfEmail := WrapField[string](fEmail)
+	vfEmail := PersistentField[string](fEmail)
 	require.Equal(t, fEmail.QualifiedName(), vfEmail.QualifiedName())
 	require.Equal(t, fEmail.Scope(), vfEmail.Scope())
 	require.Equal(t, "Email", vfEmail.Name())
 
 	// Nickname has a max length validator in the generated field.
 	nick := acct.Nickname
-	vNick := WrapField[string](nick)
+	vNick := PersistentField[string](nick)
 	long := strings.Repeat("a", 101)
 	r := vNick.validateRaw(long)
 	require.True(t, r.IsError(), "expected Nickname validator to reject long string")
 
 	// Test WrapFieldAsArray / WrapFieldAsObject flags
-	vfArray := WrapFieldAsArray[string](fEmail)
+	vfArray := PersistentField[string](fEmail).AsArray()
 	require.True(t, vfArray.IsArray())
-	vfObj := WrapFieldAsObject[string](prof.Bio)
+	vfObj := PersistentField[string](prof.Bio).AsObject()
 	require.True(t, vfObj.IsObject())
 
 	// Decimal constraint exists on orderitem.UnitPrice; ensure QualifiedName copies
 	up := oi.UnitPrice
-	vup := WrapField[float64](up)
+	vup := PersistentField[float64](up)
 	require.Equal(t, up.QualifiedName(), vup.QualifiedName())
 
-	// WithXQLFields should produce a Schema equivalent to WithFields(WrapField(...))
-	name := WrapField[string](acct.Email).Name()
+	// WithXQLFields should produce a Schema equivalent to WithFields(persistentField(...))
+	name := PersistentField[string](acct.Email).Name()
 	s1 := WithXQLFields(acct.Email)
-	json := fmt.Sprintf(`{"%s":"john@example.com"}`, name)
-	res := s1.Validate(json)
+	jsonStr := fmt.Sprintf(`{"%s":"john@example.com"}`, name)
+	res := s1.Validate(jsonStr)
 	require.False(t, res.IsError())
 
-	s2 := WithFields(WrapField[string](acct.Email))
-	res2 := s2.Validate(json)
+	s2 := WithFields(PersistentField[string](acct.Email))
+	res2 := s2.Validate(jsonStr)
 	require.False(t, res2.IsError())
 
 	// Duplicate names should panic (two identical persistent fields)
@@ -68,8 +68,8 @@ func TestWithXQLFields_MultiFieldValidation(t *testing.T) {
 
 	// Create JSON that includes the view names (last segment) and values.
 	// Use values that should pass validation.
-	json := fmt.Sprintf(`{"Email":"alice@example.com","Nickname":"Al","Amount":123.45,"UnitPrice":9.99}`)
-	res := s.Validate(json)
+	jsonStr := fmt.Sprintf(`{"Email":"alice@example.com","Nickname":"Al","Amount":123.45,"UnitPrice":9.99}`)
+	res := s.Validate(jsonStr)
 	require.False(t, res.IsError(), "expected combined schema to validate")
 
 	// Now make a Nickname too long which should fail
@@ -79,48 +79,39 @@ func TestWithXQLFields_MultiFieldValidation(t *testing.T) {
 }
 
 func TestWrapField_NameExtraction(t *testing.T) {
-	// Ensure Name() returns the last segment when QualifiedName contains schema.table
-	// Simulate by using a generated field which has table possibly set with schema.
-	// We can't change generated table, but ensure Name extracts last segment.
 	f := ord.CreatedAt
-	vf := WrapField[time.Time](f)
+	vf := PersistentField[time.Time](f)
 	require.Equal(t, "CreatedAt", vf.Name())
 }
 
 func TestWrapField_DuplicateValidatorPanics(t *testing.T) {
-	// acct.Nickname has a persistent validator 'max_length' (100). Adding another
-	// max_length via a view validator should cause WrapField to panic due to duplicate name.
 	n := acct.Nickname
 	require.Panics(t, func() {
-		_ = WrapField[string](n, validator.MaxLength(50))
+		_ = PersistentField[string](n, validator.MaxLength(50))
 	})
 }
 
 func TestWrapField_NilPanics(t *testing.T) {
-	// Passing a nil persistent field should panic
 	require.Panics(t, func() {
-		_ = WrapField[string](nil)
+		_ = PersistentField[string](nil)
 	})
 }
 
 func TestWrapField_MergesValidators(t *testing.T) {
-	// Wrap persistent Nickname and add an additional min-length validator via view
 	n := acct.Nickname
-	vf := WrapField[string](n, validator.MinLength(2))
-	// Too short should fail (min length 2)
+	vf := PersistentField[string](n, validator.MinLength(2))
 	r := vf.validateRaw("A")
 	require.True(t, r.IsError())
-	// Valid length and under persistent max should pass
 	r2 := vf.validateRaw("Abc")
 	require.False(t, r2.IsError())
 }
 
 func TestWrapField_ArrayValidation(t *testing.T) {
 	// Wrap Quantity as array and validate using WithFields
-	q := WrapFieldAsArray[int64](oi.Quantity)
+	q := PersistentField[int64](oi.Quantity).AsArray()
 	s := WithFields(q)
-	json := fmt.Sprintf(`{"%s":[1,2,3]}`, q.Name())
-	res := s.Validate(json)
+	jsonStr := fmt.Sprintf(`{"%s":[1,2,3]}`, q.Name())
+	res := s.Validate(jsonStr)
 	require.False(t, res.IsError())
 	// Non-array should fail
 	bad := fmt.Sprintf(`{"%s": 123}`, q.Name())
@@ -129,28 +120,22 @@ func TestWrapField_ArrayValidation(t *testing.T) {
 }
 
 func TestValueObject_BackendQualifiedKeys_HappyPath(t *testing.T) {
-	// Build schema from generated persistent fields
 	s := WithXQLFields(acct.Email, acct.Nickname, ord.Amount, oi.UnitPrice)
 
-	// Use JSON with view names (Name()) as keys
 	jsonStr := fmt.Sprintf(`{"%s":"bob@example.com","%s":"Bobby","%s":250.5,"%s":19.95}`,
-		WrapField[string](acct.Email).Name(),
-		WrapField[string](acct.Nickname).Name(),
-		WrapField[float64](ord.Amount).Name(),
-		WrapField[float64](oi.UnitPrice).Name(),
+		PersistentField[string](acct.Email).Name(),
+		PersistentField[string](acct.Nickname).Name(),
+		PersistentField[float64](ord.Amount).Name(),
+		PersistentField[float64](oi.UnitPrice).Name(),
 	)
 
 	res := s.Validate(jsonStr)
 	require.False(t, res.IsError(), "validation should succeed")
 	vo := res.MustGet()
 
-	// Unmarshal the JSON string to obtain expected values keyed by view name
 	var expected map[string]any
 	require.NoError(t, json.Unmarshal([]byte(jsonStr), &expected))
 
-	// For every field in the schema, ensure the validated ValueObject contains
-	// a value under the field's UniqueName() and that it equals the value from
-	// the original JSON (view name key).
 	for _, f := range s.fields {
 		exp, ok := expected[f.Name()]
 		require.True(t, ok, "test JSON must contain key %s", f.Name())
@@ -168,8 +153,8 @@ func TestValueObject_BackendQualifiedKeys_ViewOnlyFields(t *testing.T) {
 	viewB := Field[int]("user_age")
 	s := WithFields(viewA, viewB)
 
-	json := `{"user_name":"Alice","user_age":30}`
-	res := s.Validate(json)
+	jsonStr := `{"user_name":"Alice","user_age":30}`
+	res := s.Validate(jsonStr)
 	require.False(t, res.IsError())
 	vo := res.MustGet()
 

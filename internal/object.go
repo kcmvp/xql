@@ -73,8 +73,8 @@ func (vo Data) Fields() []string {
 // It panics if the property already exists or if the name contains '.'.
 func (vo Data) Add(name string, value any) {
 	_, ok := vo[name]
-	lo.Assertf(!ok, "dvo: property '%s' already exists", name)
-	lo.Assertf(!strings.Contains(name, "."), "dov: property '%s' contains '.'", name)
+	lo.Assertf(!ok, "xql: property '%s' already exists", name)
+	lo.Assertf(!strings.Contains(name, "."), "xql: property '%s' contains '.'", name)
 	vo[name] = value
 }
 
@@ -82,7 +82,7 @@ func (vo Data) Add(name string, value any) {
 // It panics if the property does not exist.
 func (vo Data) Update(name string, value any) {
 	if _, ok := vo[name]; !ok {
-		panic(fmt.Sprintf("dvo: property '%s' does not exist", name))
+		panic(fmt.Sprintf("xql: property '%s' does not exist", name))
 	}
 	vo[name] = value
 }
@@ -97,6 +97,11 @@ func (vo Data) seal() {}
 // It panics if the key exists but the type is incorrect. This function
 // supports dot notation for embedded objects and array indexing (e.g., "field.0.nestedField").
 func Get[T any](data Data, name string) mo.Option[T] {
+	if val, ok := data[name]; ok {
+		typedValue, ok := val.(T)
+		lo.Assertf(ok, "xql: field '%s' has wrong type: expected %T, got %T", name, *new(T), val)
+		return mo.Some(typedValue)
+	}
 	parts := strings.Split(name, ".")
 	var currentValue any = data
 	for _, part := range parts {
@@ -127,8 +132,8 @@ func Get[T any](data Data, name string) mo.Option[T] {
 		val := reflect.ValueOf(currentValue)
 		if val.Kind() == reflect.Slice {
 			index, err := strconv.Atoi(part)
-			lo.Assertf(err == nil, "dvo: path part '%s' in '%s' is not a valid integer index for a slice", part, name)
-			lo.Assertf(index >= 0 && index < val.Len(), "dvo: array bound exceed: %v", val)
+			lo.Assertf(err == nil, "xql: path part '%s' in '%s' is not a valid integer index for a slice", part, name)
+			lo.Assertf(index >= 0 && index < val.Len(), "xql: array bound exceed: %v", val)
 			currentValue = val.Index(index).Interface()
 			continue
 		}
@@ -137,7 +142,7 @@ func Get[T any](data Data, name string) mo.Option[T] {
 	}
 
 	typedValue, ok := currentValue.(T)
-	lo.Assertf(ok, "dvo: field '%s' has wrong type: expected %T, got %T", name, *new(T), currentValue)
+	lo.Assertf(ok, "xql: field '%s' has wrong type: expected %T, got %T", name, *new(T), currentValue)
 	return mo.Some(typedValue)
 }
 

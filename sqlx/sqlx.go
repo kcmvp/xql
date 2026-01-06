@@ -3,10 +3,13 @@ package sqlx
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"strings"
 
 	"github.com/kcmvp/xql"
 	"github.com/kcmvp/xql/entity"
 	"github.com/kcmvp/xql/internal"
+	"github.com/samber/lo"
 	"github.com/samber/mo"
 )
 
@@ -20,8 +23,7 @@ import (
 // Design principles (short):
 //  - SQL generation is pure: `sql()` returns only the SQL string and error.
 //    Execution-time arguments are produced by the lower-level builder
-//    helpers (e.g. `selectSQL`, `insertSQL`, `updateSQL`, `deleteSQL`) so
-//    generation and execution responsibilities are clearly separated.
+//    helpers (e.g. `selectSQL`, `insertSQL`, `updateSQL`, `deleteSQL`).
 //  - Public API is tiny: consumers construct `Executor` via `Query` /
 //    `Delete` / `Update` factory functions and call `Execute(ctx, db)` to
 //    run the statement. `Execute` returns a union `mo.Either` value where
@@ -30,14 +32,6 @@ import (
 //  - The package depends on generator-provided `meta.Schema` to determine
 //    projection order and mapping between SQL result columns and value
 //    object keys.
-//
-// Important helper contracts (implemented in this package):
-//  - selectSQL[T](schema *meta.Schema, where Where) (string, []any, error)
-//  - insertSQL[T](schema meta.Schema, g getter) (string, []any, error)
-//  - updateSQL[T](schema meta.Schema, g getter, where Where) (string, []any, error)
-//  - deleteSQL[T](where Where) (string, []any, error)
-//
-// NOTE: `updateExec` is currently a placeholder (not implemented).
 
 // Where is the only contract used to express predicates for CRUD.
 //
@@ -46,6 +40,10 @@ import (
 // parameter list suitable for use in a prepared statement.
 type Where interface {
 	Build() (string, []any)
+	// fields returns the referenced xql.Fields used by this Where. It's an
+	// unexported method so callers outside this package cannot implement Where
+	// (we want internal control over implementations).
+	fields() []xql.Field
 }
 
 type Schema []xql.Field
@@ -135,12 +133,26 @@ type Executor interface {
 // Usage example:
 //
 //	// build executor
-//	exec := Query[Account](schema)(Eq(field, value))
+//	// exec := Query[Account](schema)(Eq(field, value))
 //	// run
-//	resEither, err := exec.Execute(ctx, db)
+//	// resEither, err := exec.Execute(ctx, db)
 //	// check left/right and handle accordingly
 func Query[T entity.Entity](schema Schema) func(where Where) Executor {
 	return func(where Where) Executor {
+		// basic sanity checks
+		if schema == nil || len(schema) == 0 {
+			return errorExecutorSelect{err: fmt.Errorf("schema is required and must contain at least one field")}
+		}
+		// collect where fields (may be nil)
+		var wfields []xql.Field
+		if where != nil {
+			wfields = where.fields()
+		}
+		// single combined validation: ensure all referenced fields (schema + where)
+		// belong to the entity table T. validateSyntax handles empty input len==0.
+		if err := validateSyntax[T](append([]xql.Field(schema), wfields...)...); err != nil {
+			return errorExecutorSelect{err: err}
+		}
 		return queryExec[T]{schema: schema, where: where}
 	}
 }
@@ -149,19 +161,41 @@ func Query[T entity.Entity](schema Schema) func(where Where) Executor {
 //
 // Note: per design, callers should provide a non-empty where clause; the
 // implementation enforces this at builder time (deleteSQL returns error if
-// where is empty).
+// where is empty). We now validate referenced fields in Where early so callers
+// get immediate, clear errors when using fields from the wrong entity.
 func Delete[T entity.Entity](where Where) Executor {
+	// early validate where fields (if any)
+	if where != nil {
+		if err := validateSyntax[T](where.fields()...); err != nil {
+			return errorExecutorNonSelect{err: err}
+		}
+	}
 	return deleteExec[T]{where: where}
 }
 
 // Update builds a single-table UPDATE query.
 //
-// New design: public Update accepts the update payload as a meta.ValueObject;
-// the ValueObject may include a special "__schema" entry or provide its own
-// Fields() listing. This avoids a global runtime schema registry.
-func Update[T entity.Entity](values ValueObject) func(where Where) Executor {
+// New design: public Update requires the caller to provide the persistence
+// schema explicitly. The Update helper will generate SQL using the provided
+// Schema and an optional ValueObject of values to apply.
+func Update[T entity.Entity](schema Schema, values ValueObject) func(where Where) Executor {
 	return func(where Where) Executor {
-		return updateExec[T]{values: values, where: where}
+		// schema must be provided now
+		if schema == nil || len(schema) == 0 {
+			return errorExecutorNonSelect{err: fmt.Errorf("schema is required and must contain at least one field")}
+		}
+		// validate schema fields belong to T
+		if err := validateSyntax[T](schema...); err != nil {
+			return errorExecutorNonSelect{err: err}
+		}
+
+		// validate where fields against T
+		if where != nil {
+			if err := validateSyntax[T](where.fields()...); err != nil {
+				return errorExecutorNonSelect{err: err}
+			}
+		}
+		return updateExec[T]{schema: schema, values: values, where: where}
 	}
 }
 
@@ -183,17 +217,19 @@ func DeleteJoin[T entity.Entity](joinstmt string, where Where) Executor {
 
 // UpdateJoin builds an update executor that applies an EXISTS-correlated
 // join filter. The update payload values are supplied as a meta.ValueObject
-// when creating the executor via UpdateJoin[T](values)(joinstmt, where).
-func UpdateJoin[T entity.Entity](values ValueObject) func(joinstmt string, where Where) Executor {
+// when creating the executor via UpdateJoin[T](schema, values)(joinstmt, where).
+func UpdateJoin[T entity.Entity](schema Schema, values ValueObject) func(joinstmt string, where Where) Executor {
 	return func(joinstmt string, where Where) Executor {
-		return updateJoinExec[T]{values: values, joinstmt: joinstmt, where: where}
+		return updateJoinExec[T]{schema: schema, values: values, joinstmt: joinstmt, where: where}
 	}
 }
+
+type sealer struct{}
 
 // ValueObject is a thin alias over internal.ValueObject to expose it
 type ValueObject interface {
 	internal.ValueObject
-	seal()
+	seal(sealer)
 }
 
 type valueObject struct {
@@ -202,11 +238,98 @@ type valueObject struct {
 
 var _ ValueObject = (*valueObject)(nil)
 
-func (vo valueObject) seal() {}
+func (vo valueObject) seal(sealer) {}
 
-func NewValueObject(m map[string]any) ValueObject {
-	if m == nil {
-		m = map[string]any{}
+type Pair struct {
+	tuple lo.Tuple2[xql.Field, any]
+}
+
+func Tuple[T xql.FieldType](f xql.PersistentField[T], v T) Pair {
+	return Pair{tuple: lo.Tuple2[xql.Field, any]{A: &f, B: v}}
+}
+
+// FlatMap is the flattened representation expected by SQL helpers. Keys are
+// qualified dotted names like "table.column" or "table.column.view".
+type FlatMap map[string]any
+
+func MapValueObject(m FlatMap) ValueObject {
+	lo.Assert(m != nil && len(m) > 0, "mapValueObject: input map cannot be nil or empty")
+	for key := range m {
+		parts := strings.Split(key, ".")
+		lo.Assert(len(parts) >= 2, "mapValueObject: keys must contain at least table and column (%s)", key)
+	}
+	return valueObject{Data: internal.Data(m)}
+}
+
+func TupleValueObject(pairs ...Pair) ValueObject {
+	m := internal.Data{}
+	for _, p := range pairs {
+		if f := p.tuple.A; f != nil {
+			m[f.QualifiedName()] = p.tuple.B
+		}
 	}
 	return valueObject{Data: m}
+}
+
+type updateExec[T entity.Entity] struct {
+	schema Schema
+	values ValueObject
+	where  Where
+}
+
+func (u updateExec[T]) Execute(ctx context.Context, ds *sql.DB) (mo.Either[[]ValueObject, sql.Result], error) {
+	if ds == nil {
+		return mo.Right[[]ValueObject, sql.Result](nil), fmt.Errorf("db is required")
+	}
+	q, args, err := updateSQL[T](u.schema, u.values, u.where)
+	if err != nil {
+		return mo.Right[[]ValueObject, sql.Result](nil), err
+	}
+	res, err := ds.ExecContext(ctx, q, args...)
+	if err != nil {
+		return mo.Right[[]ValueObject, sql.Result](nil), err
+	}
+	return mo.Right[[]ValueObject, sql.Result](res), nil
+}
+
+func (u updateExec[T]) sql() (string, error) {
+	q, _, err := updateSQL[T](u.schema, u.values, u.where)
+	return q, err
+}
+
+// updateJoinExec implements update with join-based EXISTS filter.
+type updateJoinExec[T entity.Entity] struct {
+	schema   Schema
+	values   ValueObject
+	joinstmt string
+	where    Where
+}
+
+func (u updateJoinExec[T]) Execute(ctx context.Context, ds *sql.DB) (mo.Either[[]ValueObject, sql.Result], error) {
+	if ds == nil {
+		return mo.Right[[]ValueObject, sql.Result](nil), fmt.Errorf("db is required")
+	}
+	// build a Where representing the EXISTS(...) predicate (applies joinstmt and inner where)
+	existsWhere, err := buildExistsWhere(u.joinstmt, u.where)
+	if err != nil {
+		return mo.Right[[]ValueObject, sql.Result](nil), err
+	}
+	q, args, err := updateSQL[T](u.schema, u.values, existsWhere)
+	if err != nil {
+		return mo.Right[[]ValueObject, sql.Result](nil), err
+	}
+	res, err := ds.ExecContext(ctx, q, args...)
+	if err != nil {
+		return mo.Right[[]ValueObject, sql.Result](nil), err
+	}
+	return mo.Right[[]ValueObject, sql.Result](res), nil
+}
+
+func (u updateJoinExec[T]) sql() (string, error) {
+	existsWhere, err := buildExistsWhere(u.joinstmt, u.where)
+	if err != nil {
+		return "", err
+	}
+	ustr, _, err := updateSQL[T](u.schema, u.values, existsWhere)
+	return ustr, err
 }

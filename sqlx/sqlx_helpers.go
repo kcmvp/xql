@@ -8,7 +8,6 @@ import (
 
 	"github.com/kcmvp/xql"
 	"github.com/kcmvp/xql/entity"
-	"github.com/samber/lo"
 	"github.com/samber/mo"
 )
 
@@ -16,10 +15,17 @@ import (
 // This file contains package-private helpers used by the public `sqlx` API.
 // See sqlx.go for higher-level executors and public APIs.
 
-type whereFunc func() (string, []any)
+type whereFunc struct {
+	f    func() (string, []any)
+	flds []xql.Field
+}
 
-func (f whereFunc) Build() (string, []any) {
-	return f()
+func (wf whereFunc) Build() (string, []any) {
+	return wf.f()
+}
+
+func (wf whereFunc) fields() []xql.Field {
+	return wf.flds
 }
 
 func and(wheres ...Where) Where {
@@ -42,7 +48,17 @@ func and(wheres ...Where) Where {
 		}
 		return fmt.Sprintf("(%s)", strings.Join(clauses, " AND ")), allArgs
 	}
-	return whereFunc(f)
+
+	// aggregate fields from children
+	flds := make([]xql.Field, 0)
+	for _, w := range wheres {
+		if w == nil {
+			continue
+		}
+		// each Where must implement fields()
+		flds = append(flds, w.fields()...)
+	}
+	return whereFunc{f: f, flds: flds}
 }
 
 func or(wheres ...Where) Where {
@@ -65,7 +81,15 @@ func or(wheres ...Where) Where {
 		}
 		return fmt.Sprintf("(%s)", strings.Join(clauses, " OR ")), allArgs
 	}
-	return whereFunc(f)
+
+	flds := make([]xql.Field, 0)
+	for _, w := range wheres {
+		if w == nil {
+			continue
+		}
+		flds = append(flds, w.fields()...)
+	}
+	return whereFunc{f: f, flds: flds}
 }
 
 func dbQualifiedNameFromQName(q string) string {
@@ -105,16 +129,16 @@ func op(field xql.Field, operator string, value any) Where {
 		clause := fmt.Sprintf("%s %s ?", dbQualifiedNameFromQName(field.QualifiedName()), operator)
 		return clause, []any{value}
 	}
-	return whereFunc(f)
+	return whereFunc{f: f, flds: []xql.Field{field}}
 }
 
 func inWhere(field xql.Field, values ...any) Where {
 	if len(values) == 0 {
-		return whereFunc(func() (string, []any) { return "1=0", nil })
+		return whereFunc{f: func() (string, []any) { return "1=0", nil }, flds: []xql.Field{field}}
 	}
 	placeholders := makePlaceholders(len(values))
 	clause := fmt.Sprintf("%s IN (%s)", dbQualifiedNameFromQName(field.QualifiedName()), placeholders)
-	return whereFunc(func() (string, []any) { return clause, values })
+	return whereFunc{f: func() (string, []any) { return clause, values }, flds: []xql.Field{field}}
 }
 
 func selectSQL[T entity.Entity](schema *Schema, where Where) (string, []any, error) {
@@ -182,16 +206,55 @@ func updateSQL[T entity.Entity](schema Schema, g ValueObject, where Where) (stri
 			sets = append(sets, fmt.Sprintf("%s = ?", q))
 		}
 	} else {
+		// Build a map of viewName -> number of occurrences to detect ambiguous view names.
+		viewMap := make(map[string]int)
+		viewToField := make(map[string]xql.Field)
 		for _, f := range schema {
+			qname := f.QualifiedName()
+			parts := strings.Split(qname, ".")
+			view := parts[len(parts)-1]
+			viewMap[view]++
+			// store last seen field for the view (used only when count==1)
+			viewToField[view] = f
+		}
+
+		for _, f := range schema {
+			q := dbQualifiedNameFromQName(f.QualifiedName())
 			viewKey := f.QualifiedName()
+			// try qualified key first
 			vOpt := g.Get(viewKey)
 			if vOpt.IsAbsent() {
+				// try unqualified view name if unambiguous
+				parts := strings.Split(viewKey, ".")
+				view := parts[len(parts)-1]
+				if count := viewMap[view]; count == 1 {
+					// resolve using the single matching schema field
+					// ensure caller provided the unqualified key
+					vOpt = g.Get(view)
+					if !vOpt.IsAbsent() {
+						// good: resolved by view name -> use it
+					} else {
+						// not present by either qualified or unqualified name; skip
+					}
+				} else if count > 1 {
+					// ambiguous view name in schema; require qualified key from caller
+					// do not attempt to resolve automatically
+					vOpt = g.Get(view) // attempt to see if caller used ambiguous name
+					if !vOpt.IsAbsent() {
+						return "", nil, fmt.Errorf("ambiguous view name %q present in schema; use qualified field name %q instead", view, viewKey)
+					}
+				}
+			}
+
+			if vOpt.IsAbsent() {
+				// no value provided for this schema field; skip
 				continue
 			}
-			q := dbQualifiedNameFromQName(f.QualifiedName())
+
 			sets = append(sets, fmt.Sprintf("%s = ?", q))
 			args = append(args, vOpt.MustGet())
 		}
+
 		if len(sets) == 0 {
 			return "", nil, fmt.Errorf("no fields to update")
 		}
@@ -206,18 +269,12 @@ func updateSQL[T entity.Entity](schema Schema, g ValueObject, where Where) (stri
 
 // updateSQLFromValues builds an UPDATE statement using the provided ValueObject.
 // Behavior:
-//   - If the ValueObject contains a special key "__schema" with a meta.Schema,
-//     that schema is used to determine the set of possible columns. For each
-//     field in the schema, if the ValueObject contains a value for that field
-//     the corresponding SET will include a placeholder and the value will be
-//     appended to args. If the ValueObject does not contain a value for that
-//     schema field, the SET will still include a placeholder (for generated SQL
-//     inspection) but no value is appended (this mirrors prior generation-only
-//     behavior).
-//   - Otherwise, the ValueObject's Fields() (excluding the special key) are
-//     used as the list of fields to update; these names are converted to
-//     snake_case for DB column names.
-func updateSQLFromValues[T entity.Entity](g ValueObject, where Where) (string, []any, error) {
+//   - The ValueObject's Fields() are used as the list of fields to update.
+//     Keys that are qualified (contain '.') are treated as fully-qualified
+//     persistence names and must belong to the same table as the generic T.
+//     Unqualified keys are treated as view/property names and are mapped to
+//     snake_case columns on T's table.
+func updateSQLFromValues[T entity.Entity](setter ValueObject, where Where) (string, []any, error) {
 	if where == nil {
 		return "", nil, fmt.Errorf("where is required")
 	}
@@ -225,7 +282,7 @@ func updateSQLFromValues[T entity.Entity](g ValueObject, where Where) (string, [
 	if whereClause == "" {
 		return "", nil, fmt.Errorf("where is required")
 	}
-	if g == nil {
+	if setter == nil {
 		return "", nil, fmt.Errorf("values is required")
 	}
 
@@ -238,53 +295,39 @@ func updateSQLFromValues[T entity.Entity](g ValueObject, where Where) (string, [
 	sets := make([]string, 0)
 	args := make([]any, 0)
 
-	// Try to obtain schema from values
-	var schema Schema
-	if sOpt := g.Get("__schema"); !sOpt.IsAbsent() {
-		v := sOpt.MustGet()
-		// accept meta.Schema or []meta.Field
-		switch sv := v.(type) {
-		case Schema:
-			schema = sv
-		case []xql.Field:
-			schema = Schema(sv)
-		case *[]xql.Field:
-			schema = Schema(*sv)
-		default:
-			// ignore and fallback to Fields()
+	// Use keys from the ValueObject (exclude nothing special)
+	for _, k := range setter.Fields() {
+		vOpt := setter.Get(k)
+		if vOpt.IsAbsent() {
+			continue
 		}
+
+		var q string
+		if strings.Contains(k, ".") {
+			// keyed value is qualified. Normalize to db-qualified name (table.col)
+			q = dbQualifiedNameFromQName(k)
+			parts := strings.Split(q, ".")
+			if len(parts) < 2 {
+				return "", nil, fmt.Errorf("invalid qualified name: %s", k)
+			}
+			// table part may contain dots (schema.table), so join all but the last element
+			tablePart := strings.Join(parts[:len(parts)-1], ".")
+			if tablePart != table {
+				return "", nil, fmt.Errorf("field %q belongs to table %q, expected %q", k, tablePart, table)
+			}
+		} else {
+			// Strict enforcement: unqualified keys are not allowed here. Callers that
+			// want to provide view-style (unqualified) keys must use the schema-aware
+			// Update/UpdateJoin APIs which accept a Schema and resolve view keys.
+			return "", nil, fmt.Errorf("unqualified value key %q is not allowed in this context; provide a persistence schema via Update(schema, ...) or use a fully-qualified key 'table.column'", k)
+		}
+
+		sets = append(sets, fmt.Sprintf("%s = ?", q))
+		args = append(args, vOpt.MustGet())
 	}
 
-	if schema != nil && len(schema) > 0 {
-		// Use schema order
-		for _, f := range schema {
-			colName := dbQualifiedNameFromQName(f.QualifiedName())
-			sets = append(sets, fmt.Sprintf("%s = ?", colName))
-			if vOpt := g.Get(f.QualifiedName()); !vOpt.IsAbsent() {
-				args = append(args, vOpt.MustGet())
-			}
-		}
-		if len(sets) == 0 {
-			return "", nil, fmt.Errorf("no fields to update")
-		}
-	} else {
-		// Use keys from the ValueObject (exclude special keys)
-		for _, k := range g.Fields() {
-			if k == "__schema" {
-				continue
-			}
-			vOpt := g.Get(k)
-			if vOpt.IsAbsent() {
-				continue
-			}
-			col := lo.SnakeCase(k)
-			q := fmt.Sprintf("%s.%s", table, col)
-			sets = append(sets, fmt.Sprintf("%s = ?", q))
-			args = append(args, vOpt.MustGet())
-		}
-		if len(sets) == 0 {
-			return "", nil, fmt.Errorf("no fields to update")
-		}
+	if len(sets) == 0 {
+		return "", nil, fmt.Errorf("no fields to update")
 	}
 
 	sql := fmt.Sprintf("UPDATE %s SET %s WHERE %s", table, strings.Join(sets, ", "), whereClause)
@@ -421,7 +464,12 @@ func buildExistsWhere(joinstmt string, where Where) (Where, error) {
 		sub = sub + ")"
 		return sub, args
 	}
-	return whereFunc(w), nil
+	// aggregate fields from inner where
+	flds := make([]xql.Field, 0)
+	if where != nil {
+		flds = append(flds, where.fields()...)
+	}
+	return whereFunc{f: w, flds: flds}, nil
 }
 
 // rowsToValueObjects maps query results to meta.ValueObject using the schema order.
@@ -529,30 +577,7 @@ func (d deleteExec[T]) sql() (string, error) {
 // Executors - UPDATE
 // -----------------------------
 
-type updateExec[T entity.Entity] struct {
-	values ValueObject
-	where  Where
-}
-
-func (u updateExec[T]) Execute(ctx context.Context, ds *sql.DB) (mo.Either[[]ValueObject, sql.Result], error) {
-	if ds == nil {
-		return mo.Right[[]ValueObject, sql.Result](nil), fmt.Errorf("db is required")
-	}
-	q, args, err := updateSQLFromValues[T](u.values, u.where)
-	if err != nil {
-		return mo.Right[[]ValueObject, sql.Result](nil), err
-	}
-	res, err := ds.ExecContext(ctx, q, args...)
-	if err != nil {
-		return mo.Right[[]ValueObject, sql.Result](nil), err
-	}
-	return mo.Right[[]ValueObject, sql.Result](res), nil
-}
-
-func (u updateExec[T]) sql() (string, error) {
-	q, _, err := updateSQLFromValues[T](u.values, u.where)
-	return q, err
-}
+// (moved to sqlx.go: updateExec implementation that is schema-aware)
 
 // -----------------------------
 // Executors - JOIN
@@ -616,38 +641,48 @@ func (j joinDeleteExec) sql() (string, error) {
 	return q, err
 }
 
-// updateJoinExec implements update with join-based EXISTS filter.
-type updateJoinExec[T entity.Entity] struct {
-	values   ValueObject
-	joinstmt string
-	where    Where
+// validateSyntax verifies that all provided fields belong to the table for T.
+func validateSyntax[T entity.Entity](fields ...xql.Field) error {
+	if len(fields) == 0 {
+		return nil
+	}
+	var ent T
+	expected := ent.Table()
+	if strings.TrimSpace(expected) == "" {
+		return fmt.Errorf("entity table is empty")
+	}
+	for _, f := range fields {
+		if f == nil {
+			continue
+		}
+		q := dbQualifiedNameFromQName(f.QualifiedName())
+		parts := strings.Split(q, ".")
+		if len(parts) < 2 {
+			return fmt.Errorf("invalid qualified name: %s", f.QualifiedName())
+		}
+		tablePart := strings.Join(parts[:len(parts)-1], ".")
+		if tablePart != expected {
+			return fmt.Errorf("field %q belongs to table %q, expected %q", f.QualifiedName(), tablePart, expected)
+		}
+	}
+	return nil
 }
 
-func (u updateJoinExec[T]) Execute(ctx context.Context, ds *sql.DB) (mo.Either[[]ValueObject, sql.Result], error) {
-	if ds == nil {
-		return mo.Right[[]ValueObject, sql.Result](nil), fmt.Errorf("db is required")
-	}
-	// build a Where representing the EXISTS(...) predicate (applies joinstmt and inner where)
-	existsWhere, err := buildExistsWhere(u.joinstmt, u.where)
-	if err != nil {
-		return mo.Right[[]ValueObject, sql.Result](nil), err
-	}
-	q, args, err := updateSQLFromValues[T](u.values, existsWhere)
-	if err != nil {
-		return mo.Right[[]ValueObject, sql.Result](nil), err
-	}
-	res, err := ds.ExecContext(ctx, q, args...)
-	if err != nil {
-		return mo.Right[[]ValueObject, sql.Result](nil), err
-	}
-	return mo.Right[[]ValueObject, sql.Result](res), nil
+// error executor implementations returned when validation fails early.
+// They implement the Executor interface and always return the stored error.
+
+type errorExecutorSelect struct{ err error }
+
+func (e errorExecutorSelect) Execute(ctx context.Context, ds *sql.DB) (mo.Either[[]ValueObject, sql.Result], error) {
+	return mo.Left[[]ValueObject, sql.Result](nil), e.err
 }
 
-func (u updateJoinExec[T]) sql() (string, error) {
-	existsWhere, err := buildExistsWhere(u.joinstmt, u.where)
-	if err != nil {
-		return "", err
-	}
-	ustr, _, err := updateSQLFromValues[T](u.values, existsWhere)
-	return ustr, err
+func (e errorExecutorSelect) sql() (string, error) { return "", e.err }
+
+type errorExecutorNonSelect struct{ err error }
+
+func (e errorExecutorNonSelect) Execute(ctx context.Context, ds *sql.DB) (mo.Either[[]ValueObject, sql.Result], error) {
+	return mo.Right[[]ValueObject, sql.Result](nil), e.err
 }
+
+func (e errorExecutorNonSelect) sql() (string, error) { return "", e.err }

@@ -118,12 +118,6 @@ func (f *JSONField[T]) embeddedObject() mo.Option[*Schema] {
 
 var _ ViewField = (*JSONField[string])(nil)
 
-// Keep small references to wrapper functions to avoid "unused function" warnings
-// These are public helpers intended for API consumers; referencing them here
-// prevents static analysis from flagging them as unused while keeping them available.
-var _ = WrapFieldAsObject[string]
-var _ = WrapFieldAsArray[string]
-
 // Note: ViewField is sealed via unexported methods, so only types defined in
 // this package implement it. Callers should pass ViewField values to
 // `WithFields` when constructing a Schema.
@@ -162,6 +156,20 @@ func (f *JSONField[T]) UniqueName() string {
 
 func (f *JSONField[T]) Optional() *JSONField[T] {
 	f.required = false
+	return f
+}
+
+// AsObject marks the JSONField as an embedded object and returns the field
+// so callers can chain: PersistentField(...).AsObject()
+func (f *JSONField[T]) AsObject() *JSONField[T] {
+	f.object = true
+	return f
+}
+
+// AsArray marks the JSONField as an array and returns the field so callers
+// can chain: PersistentField(...).AsArray()
+func (f *JSONField[T]) AsArray() *JSONField[T] {
+	f.array = true
 	return f
 }
 
@@ -205,7 +213,7 @@ func (f *JSONField[T]) validate(node gjson.Result) mo.Result[any] {
 	// Case: Array
 	if f.IsArray() {
 		if !node.IsArray() {
-			return mo.Err[any](fmt.Errorf("dvo: field '%s' expected a JSON array but got Clause", f.Name()))
+			return mo.Err[any](fmt.Errorf("xql: field '%s' expected a JSON array but got Clause", f.Name()))
 		}
 		errs := &validationError{}
 		// Subcase: Array of Objects
@@ -433,14 +441,14 @@ func Field[T validator.FieldType](name string, vfs ...validator.ValidateFunc[T])
 
 func trait[T validator.FieldType](name string, isArray, isObject bool, nested *Schema, vfs ...validator.ValidateFunc[T]) *JSONField[T] {
 	if strings.ContainsAny(name, ".#") {
-		panic(fmt.Sprintf("dvo: field name '%s' cannot contain '.' or '#'", name))
+		panic(fmt.Sprintf("xql: field name '%s' cannot contain '.' or '#'", name))
 	}
 	names := make(map[string]struct{})
 	var nf []validator.Validator[T]
 	for _, v := range vfs {
 		n, f := v()
 		if _, exists := names[n]; exists {
-			panic(fmt.Sprintf("dvo: duplicate validator '%s' for field '%s'", n, name))
+			panic(fmt.Sprintf("xql: duplicate validator '%s' for field '%s'", n, name))
 		}
 		names[n] = struct{}{}
 		nf = append(nf, f)
@@ -456,10 +464,19 @@ func trait[T validator.FieldType](name string, isArray, isObject bool, nested *S
 	}
 }
 
-// WrapField wraps an existing persistent xql.PersistentField into a view JSONField[T].
-func WrapField[T validator.FieldType](f *xql.PersistentField[T], vfs ...validator.ValidateFunc[T]) *JSONField[T] {
+// PersistentField builds a view `JSONField[T]` from a persistent `xql.PersistentField[T]`.
+//
+// It copies persistence metadata (qualified name and scope) and merges validators from the
+// persistent definition with any view-layer validators provided. If a validator with the
+// same name is supplied by both the persistent field and the view layer, this function
+// will panic to prevent ambiguous validation behavior.
+//
+// The returned `*JSONField[T]` is a view-layer wrapper that performs parsing and
+// validation appropriate for HTTP/JSON inputs while carrying the persistence QualifiedName
+// and Scope so the validated `ValueObject` can be mapped back to persistence layer keys.
+func PersistentField[T validator.FieldType](f *xql.PersistentField[T], vfs ...validator.ValidateFunc[T]) *JSONField[T] {
 	if f == nil {
-		panic("view: WrapField requires a non-nil *xql.PersistentField[T]")
+		panic("view: PersistentField requires a non-nil *xql.PersistentField[T]")
 	}
 
 	var validators []validator.Validator[T]
@@ -470,7 +487,7 @@ func WrapField[T validator.FieldType](f *xql.PersistentField[T], vfs ...validato
 	for _, vf := range f.Constraints() {
 		name, fn := vf()
 		if _, exists := names[name]; exists {
-			panic(fmt.Sprintf("dvo: duplicate validator '%s' from persistent field in WrapField", name))
+			panic(fmt.Sprintf("xql: duplicate validator '%s' from persistent field in PersistentField", name))
 		}
 		names[name] = struct{}{}
 		fnLocal := fn
@@ -481,7 +498,7 @@ func WrapField[T validator.FieldType](f *xql.PersistentField[T], vfs ...validato
 	for _, vf := range vfs {
 		name, fn := vf()
 		if _, ok := names[name]; ok {
-			panic(fmt.Sprintf("dvo: duplicate validator '%s' in WrapField", name))
+			panic(fmt.Sprintf("xql: duplicate validator '%s' in PersistentField", name))
 		}
 		names[name] = struct{}{}
 		fnLocal := fn
@@ -499,20 +516,6 @@ func WrapField[T validator.FieldType](f *xql.PersistentField[T], vfs ...validato
 	}
 }
 
-// WrapFieldAsObject wraps an xql.PersistentField as an embedded object field.
-func WrapFieldAsObject[T validator.FieldType](f *xql.PersistentField[T], vfs ...validator.ValidateFunc[T]) *JSONField[T] {
-	jf := WrapField[T](f, vfs...)
-	jf.object = true
-	return jf
-}
-
-// WrapFieldAsArray wraps an xql.PersistentField as an array field.
-func WrapFieldAsArray[T validator.FieldType](f *xql.PersistentField[T], vfs ...validator.ValidateFunc[T]) *JSONField[T] {
-	jf := WrapField[T](f, vfs...)
-	jf.array = true
-	return jf
-}
-
 // Schema is a blueprint for validating a raw object.
 type Schema struct {
 	fields             []ViewField
@@ -527,7 +530,7 @@ func WithFields(fields ...ViewField) *Schema {
 	names := make(map[string]struct{})
 	for _, f := range fields {
 		if _, exists := names[f.Name()]; exists {
-			panic(fmt.Sprintf("dvo: duplicate field name '%s' in Schema definition", f.Name()))
+			panic(fmt.Sprintf("xql: duplicate field name '%s' in Schema definition", f.Name()))
 		}
 		names[f.Name()] = struct{}{}
 	}
@@ -539,62 +542,20 @@ func WithFields(fields ...ViewField) *Schema {
 			continue
 		}
 		if _, exists := qnames[qn]; exists {
-			panic(fmt.Sprintf("dvo: duplicate qualified name '%s' in Schema definition", qn))
+			panic(fmt.Sprintf("xql: duplicate qualified name '%s' in Schema definition", qn))
 		}
 		qnames[qn] = struct{}{}
 	}
 	return &Schema{fields: fields, allowUnknownFields: false}
 }
 
-// WithXQLFields constructs a Schema from provided persistent xql.Field values.
-// Each xql.Field will be converted to a view JSONField by calling WrapField.
-// This is a convenience for consumers who wish to build view schemas directly
-// from generated persistent fields. Only the built-in FieldType type set is
-// supported — if an unsupported concrete type is passed this function panics.
-func WithXQLFields(fields ...xql.Field) *Schema {
-	vf := make([]ViewField, 0, len(fields))
-	for _, f := range fields {
-		switch concrete := f.(type) {
-		case *xql.PersistentField[int]:
-			vf = append(vf, WrapField[int](concrete))
-		case *xql.PersistentField[int8]:
-			vf = append(vf, WrapField[int8](concrete))
-		case *xql.PersistentField[int16]:
-			vf = append(vf, WrapField[int16](concrete))
-		case *xql.PersistentField[int32]:
-			vf = append(vf, WrapField[int32](concrete))
-		case *xql.PersistentField[int64]:
-			vf = append(vf, WrapField[int64](concrete))
-		case *xql.PersistentField[uint]:
-			vf = append(vf, WrapField[uint](concrete))
-		case *xql.PersistentField[uint8]:
-			vf = append(vf, WrapField[uint8](concrete))
-		case *xql.PersistentField[uint16]:
-			vf = append(vf, WrapField[uint16](concrete))
-		case *xql.PersistentField[uint32]:
-			vf = append(vf, WrapField[uint32](concrete))
-		case *xql.PersistentField[uint64]:
-			vf = append(vf, WrapField[uint64](concrete))
-		case *xql.PersistentField[float32]:
-			vf = append(vf, WrapField[float32](concrete))
-		case *xql.PersistentField[float64]:
-			vf = append(vf, WrapField[float64](concrete))
-		case *xql.PersistentField[string]:
-			vf = append(vf, WrapField[string](concrete))
-		case *xql.PersistentField[bool]:
-			vf = append(vf, WrapField[bool](concrete))
-		case *xql.PersistentField[time.Time]:
-			vf = append(vf, WrapField[time.Time](concrete))
-		default:
-			panic(fmt.Sprintf("view: WithXQLFields: unsupported xql.Field concrete type %T", f))
-		}
-	}
-	return WithFields(vf...)
-}
-
-// AllowUnknownFields is a fluent method to make the Schema accept JSON/url params
-// that contain fields not defined in the schema. Default behavior is to disallow.
+// AllowUnknownFields is a fluent helper to enable acceptance of unknown JSON/url
+// parameters during validation. It sets the flag on the Schema and returns the
+// same Schema pointer for chaining.
 func (s *Schema) AllowUnknownFields() *Schema {
+	if s == nil {
+		return s
+	}
 	s.allowUnknownFields = true
 	return s
 }
@@ -611,7 +572,7 @@ func (s *Schema) Extend(another *Schema) *Schema {
 	names := make(map[string]struct{})
 	for _, f := range newFields {
 		if _, exists := names[f.Name()]; exists {
-			panic(fmt.Sprintf("dvo: duplicate field name '%s' found during Extend", f.Name()))
+			panic(fmt.Sprintf("xql: duplicate field name '%s' found during Extend", f.Name()))
 		}
 		names[f.Name()] = struct{}{}
 	}
@@ -632,22 +593,13 @@ func (s *Schema) Extend(another *Schema) *Schema {
 //
 // For example, given a ValueObject `vo` representing the JSON:
 //
-//	{
-//	  "user": { "email": "test@example.com" },
-//	  "items": [ { "id": 101 } ]
-//	}
-//
-// You can access embedded values like this:
-//
 //	email := vo.MstString("user.email") // "test@example.com"
-//	itemID := vo.MstInt("items.0.id")   // 101
+//
+// itemID := vo.MstInt("items.0.id")   // 101
 //
 // If a path is invalid (e.g., key not found), the `Option`
 // based getters (like `Clause`) will return `mo.None`, while the `Mst` prefixed
 // getters (like `MstString`) will panic.
-//
-// If a path is malformed (e.g., non-integer index for an array, out-of-bounds index)
-// or a type mismatch occurs, all getters will panic.
 type ValueObject interface {
 	internal.ValueObject
 	// StringArray returns an Option containing a slice of strings for the given name.
@@ -680,6 +632,9 @@ type ValueObject interface {
 	// MstBoolArray returns a slice of bools for the given name.
 	// It panics if the key is not found or the value is not a []bool.
 	MstBoolArray(name string) []bool
+	// FlatMap converts the ValueObject into a flattened map keyed by dotted
+	// qualified names (e.g. "table.column.view" or "table.column").
+	FlatMap() sqlx.FlatMap
 	seal()
 }
 
@@ -700,35 +655,56 @@ func (vo valueObject) MarshalJSON() ([]byte, error) {
 
 func (vo valueObject) seal() {}
 
-func (vo valueObject) StringArray(name string) mo.Option[[]string] {
-	return internal.Get[[]string](vo.Data, name)
-}
-func (vo valueObject) MstStringArray(name string) []string {
-	return vo.StringArray(name).MustGet()
-}
-func (vo valueObject) IntArray(name string) mo.Option[[]int] {
-	return internal.Get[[]int](vo.Data, name)
-}
-func (vo valueObject) MstIntArray(name string) []int {
-	return vo.IntArray(name).MustGet()
-}
-func (vo valueObject) Int64Array(name string) mo.Option[[]int64] {
-	return internal.Get[[]int64](vo.Data, name)
-}
-func (vo valueObject) MstInt64Array(name string) []int64 {
-	return vo.Int64Array(name).MustGet()
-}
-func (vo valueObject) Float64Array(name string) mo.Option[[]float64] {
-	return internal.Get[[]float64](vo.Data, name)
-}
-func (vo valueObject) MstFloat64Array(name string) []float64 {
-	return vo.Float64Array(name).MustGet()
-}
-func (vo valueObject) BoolArray(name string) mo.Option[[]bool] {
-	return internal.Get[[]bool](vo.Data, name)
-}
-func (vo valueObject) MstBoolArray(name string) []bool {
-	return vo.BoolArray(name).MustGet()
+// FlatMap converts the valueObject into a flattened map[string]any. It iterates over
+// the structure recursively and produces dotted keys for nested fields.
+func (vo valueObject) FlatMap() sqlx.FlatMap {
+	out := make(sqlx.FlatMap)
+	// recursive walker
+	var walk func(prefix string, v any)
+	walk = func(prefix string, v any) {
+		switch val := v.(type) {
+		case internal.Data:
+			for k, vv := range val {
+				nk := k
+				if prefix != "" {
+					nk = prefix + "." + k
+				}
+				walk(nk, vv)
+			}
+		case valueObject:
+			// expose underlying Data for nested valueObject
+			for _, fk := range val.Fields() {
+				if opt := val.Get(fk); opt.IsPresent() {
+					v := opt.MustGet()
+					nk := fk
+					if prefix != "" {
+						nk = prefix + "." + fk
+					}
+					walk(nk, v)
+				}
+			}
+		case map[string]any:
+			for k, vv := range val {
+				nk := k
+				if prefix != "" {
+					nk = prefix + "." + k
+				}
+				walk(nk, vv)
+			}
+		default:
+			// arrays and primitives are stored as-is under the accumulated prefix
+			if prefix != "" {
+				out[prefix] = val
+			}
+		}
+	}
+
+	for _, k := range vo.Fields() {
+		if opt := vo.Get(k); opt.IsPresent() {
+			walk(k, opt.MustGet())
+		}
+	}
+	return out
 }
 
 // setObjectField stores a validated value into the provided internal.Data map
@@ -891,23 +867,68 @@ func (s *Schema) Validate(json string, urlParams ...map[string]string) mo.Result
 	}))
 }
 
-// ToSQLXValueObject converts a view.ValueObject (validated by a Schema)
-// into a sqlx.ValueObject suitable for the sqlx package. It copies all
-// top-level fields from the view.ValueObject into a new internal.Data map
-// and returns sqlx.NewValueObject(map).
+// WithXQLFields builds a view `Schema` from one or more persistent `xql.Field` values.
 //
-// Note: view.ValueObject may store nested objects under top-level keys
-// (for dotted qualified names). This function preserves those nested maps
-// so sqlx/internal.Gets dot-path traversal continues to work.
-func ToSQLXValueObject(vo ValueObject) sqlx.ValueObject {
-	if vo == nil {
-		return sqlx.NewValueObject(nil)
-	}
-	m := internal.Data{}
-	for _, k := range vo.Fields() {
-		if opt := vo.Get(k); opt.IsPresent() {
-			m[k] = opt.MustGet()
+// Behavior and contract:
+//   - Each provided `xql.Field` must be a concrete `*xql.PersistentField[T]` produced
+//     by generator code (common generated fields live under `sample/gen/field`).
+//   - The function converts each persistent field into a view-layer `ViewField` by
+//     creating a `PersistentField[T]` wrapper. Any validator factories attached to the
+//     persistent field are carried into the resulting view field so view-layer
+//     validation honors constraints declared at generation time.
+//   - The resulting `Schema` validates JSON using the view/key (the persistent field's
+//     view name, i.e. the last segment). After successful validation each value is
+//     stored under the field's `UniqueName()` (which for persistent fields is the
+//     qualified persistence identifier, e.g. "table.column.view"). This preserves the
+//     mapping between view input and backend identifiers required by SQL helpers.
+//   - If a provided field's concrete generic type is not supported by this conversion
+//     (e.g. an unexpected underlying type), the call will panic with a descriptive
+//     message.
+//
+// Example:
+//
+//	s := WithXQLFields(account.Email, account.Nickname)
+//	res := s.Validate(`{"Email":"a@x.com","Nickname":"Joe"}`)
+//
+// Notes:
+//   - This helper is intended for use with generator-produced `xql.Field` values.
+func WithXQLFields(fields ...xql.Field) *Schema {
+	vf := make([]ViewField, 0, len(fields))
+	for _, f := range fields {
+		switch concrete := f.(type) {
+		case *xql.PersistentField[int]:
+			vf = append(vf, PersistentField[int](concrete))
+		case *xql.PersistentField[int8]:
+			vf = append(vf, PersistentField[int8](concrete))
+		case *xql.PersistentField[int16]:
+			vf = append(vf, PersistentField[int16](concrete))
+		case *xql.PersistentField[int32]:
+			vf = append(vf, PersistentField[int32](concrete))
+		case *xql.PersistentField[int64]:
+			vf = append(vf, PersistentField[int64](concrete))
+		case *xql.PersistentField[uint]:
+			vf = append(vf, PersistentField[uint](concrete))
+		case *xql.PersistentField[uint8]:
+			vf = append(vf, PersistentField[uint8](concrete))
+		case *xql.PersistentField[uint16]:
+			vf = append(vf, PersistentField[uint16](concrete))
+		case *xql.PersistentField[uint32]:
+			vf = append(vf, PersistentField[uint32](concrete))
+		case *xql.PersistentField[uint64]:
+			vf = append(vf, PersistentField[uint64](concrete))
+		case *xql.PersistentField[float32]:
+			vf = append(vf, PersistentField[float32](concrete))
+		case *xql.PersistentField[float64]:
+			vf = append(vf, PersistentField[float64](concrete))
+		case *xql.PersistentField[string]:
+			vf = append(vf, PersistentField[string](concrete))
+		case *xql.PersistentField[bool]:
+			vf = append(vf, PersistentField[bool](concrete))
+		case *xql.PersistentField[time.Time]:
+			vf = append(vf, PersistentField[time.Time](concrete))
+		default:
+			panic(fmt.Sprintf("view: WithXQLFields: unsupported xql.Field concrete type %T", f))
 		}
 	}
-	return sqlx.NewValueObject(m)
+	return WithFields(vf...)
 }
